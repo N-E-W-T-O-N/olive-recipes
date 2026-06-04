@@ -1,30 +1,21 @@
 import argparse
 import json
-import os
- 
- 
-
 import onnxruntime_genai as og
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ONNX Runtime GenAI inference for unsloth/Qwen3.5-0.8B"
+        description="ONNX Runtime GenAI inference for datalab-to/surya-ocr-2"
     )
     parser.add_argument("--model_path", type=str, default="cpu_and_mobile/models",
                         help="Path to the model directory containing genai_config.json and ONNX models")
-    parser.add_argument("--image", type=str, default=None, help="Path to image file")
-    parser.add_argument("--prompt", type=str, default=None, help="Text prompt")
+    parser.add_argument("--image", type=str, default=None, help="Path to image/document file")
+    parser.add_argument("--prompt", type=str, default=None, help="OCR or document analysis prompt")
     parser.add_argument("--interactive", action="store_true", help="Run in interactive mode")
     args = parser.parse_args()
 
     print(f"Loading model from: {args.model_path}")
-    config = og.Config(f"{args.model_path}")
-
-   # config.clear_providers()
-    #config.append_provider("OpenVINOExecutionProvider")
-    model = og.Model(config)
-    #model = og.Model(args.model_path)
+    model = og.Model(args.model_path)
     processor = model.create_multimodal_processor()
     tokenizer = og.Tokenizer(model)
     tokenizer_stream = processor.create_stream()
@@ -34,8 +25,13 @@ def main():
     elif args.prompt:
         generate_response(model, processor, tokenizer, tokenizer_stream, args.prompt, args.image)
     else:
-        print("Please provide --prompt or use --interactive mode")
-        parser.print_help()
+        # Default OCR prompt for document images
+        default_prompt = "OCR the full text of this document."
+        if args.image:
+            generate_response(model, processor, tokenizer, tokenizer_stream, default_prompt, args.image)
+        else:
+            print("Please provide --prompt and/or --image, or use --interactive mode")
+            parser.print_help()
 
 
 def generate_response(model, processor, tokenizer, tokenizer_stream, prompt, image_path):
@@ -50,7 +46,7 @@ def generate_response(model, processor, tokenizer, tokenizer_stream, prompt, ima
     full_prompt = tokenizer.apply_chat_template(json.dumps(messages), add_generation_prompt=True)
     print(f"\nPrompt: {prompt}")
     if image_path:
-        print(f"Image: {image_path}")
+        print(f"Image:  {image_path}")
     print("\nGenerating response...")
 
     inputs = processor(full_prompt, images=images)
@@ -69,10 +65,12 @@ def generate_response(model, processor, tokenizer, tokenizer_stream, prompt, ima
 
 
 def interactive_mode(model, processor, tokenizer, tokenizer_stream):
-    print("\n" + "=" * 50)
-    print("Interactive Mode — Enter 'quit' or 'exit' to stop")
-    print("To include an image, prefix with: image:/path/to/image.jpg  <prompt>")
-    print("=" * 50 + "\n")
+    print("\n" + "=" * 55)
+    print("Surya OCR-2 Interactive Mode")
+    print("Enter 'quit' or 'exit' to stop")
+    print("To include an image: image:/path/to/doc.png  <prompt>")
+    print("Default prompt when only image given: 'OCR the full text of this document.'")
+    print("=" * 55 + "\n")
 
     while True:
         try:
@@ -82,7 +80,7 @@ def interactive_mode(model, processor, tokenizer, tokenizer_stream):
         if user_input.lower() in ("quit", "exit"):
             break
         if not user_input:
-            print("Please enter a prompt.")
+            print("Please enter a prompt or image path.")
             continue
 
         image_path = None
@@ -90,7 +88,7 @@ def interactive_mode(model, processor, tokenizer, tokenizer_stream):
         if user_input.startswith("image:"):
             parts = user_input.split(" ", 1)
             image_path = parts[0][6:]
-            prompt = parts[1] if len(parts) > 1 else "Describe this image"
+            prompt = parts[1] if len(parts) > 1 else "OCR the full text of this document."
 
         try:
             generate_response(model, processor, tokenizer, tokenizer_stream, prompt, image_path)
@@ -98,7 +96,7 @@ def interactive_mode(model, processor, tokenizer, tokenizer_stream):
             print(f"Error: {e}")
             import traceback
             traceback.print_exc()
-        print("-" * 50 + "\n")
+        print("-" * 55 + "\n")
 
     print("Goodbye!")
 

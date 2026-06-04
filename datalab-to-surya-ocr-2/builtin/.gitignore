@@ -1,0 +1,4 @@
+cpu_and_mobile/models/
+cuda/models/
+__pycache__/
+*.pyc

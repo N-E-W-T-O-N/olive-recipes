@@ -1,0 +1,9 @@
+git+https://github.com/microsoft/Olive.git@main
+torch>=2.10.0
+torchaudio>=2.1.0
+transformers>=5.3.0
+onnxruntime>=1.18.0
+onnxruntime-genai>=0.14.0
+
+# For Higgs Audio Tokenizer export (voice cloning components — optional):
+# boson-multimodal @ git+https://github.com/boson-ai/higgs-audio.git

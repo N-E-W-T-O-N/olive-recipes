@@ -1,0 +1,19 @@
+{
+    "input_model": {
+        "type": "HfModel",
+        "model_path": "cpu_fp16/qwen3_standalone"
+    },
+    "passes": {
+        "convert": {
+            "type": "ModelBuilder",
+            "precision": "fp16",
+            "extra_options": {
+                "filename": "llm_decoder.onnx",
+                "exclude_embeds": true,
+                "exclude_lm_head": true
+            }
+        }
+    },
+    "no_artifacts": true,
+    "output_dir": "cpu_fp16/models/llm_decoder.onnx"
+}

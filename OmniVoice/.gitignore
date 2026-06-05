@@ -1,0 +1,8 @@
+cpu_and_mobile/models/
+cpu_and_mobile/qwen3_standalone/
+cpu_fp16/models/
+cpu_fp16/qwen3_standalone/
+cuda/models/
+cuda/qwen3_standalone/
+__pycache__/
+*.pyc

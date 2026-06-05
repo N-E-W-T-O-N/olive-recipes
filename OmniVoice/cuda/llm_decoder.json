@@ -1,0 +1,25 @@
+{
+    "input_model": {
+        "type": "HfModel",
+        "model_path": "cuda/qwen3_standalone"
+    },
+    "passes": {
+        "convert": {
+            "type": "ModelBuilder",
+            "precision": "fp16",
+            "extra_options": {
+                "filename": "llm_decoder.onnx",
+                "exclude_embeds": true,
+                "exclude_lm_head": true
+            }
+        }
+    },
+    "engine": {
+        "target": {
+            "type": "LocalSystem",
+            "accelerators": [{ "device": "gpu", "execution_providers": ["CUDAExecutionProvider"] }]
+        }
+    },
+    "no_artifacts": true,
+    "output_dir": "cuda/models/llm_decoder.onnx"
+}

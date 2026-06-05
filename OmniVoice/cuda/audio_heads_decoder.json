@@ -1,0 +1,42 @@
+{
+    "input_model": {
+        "type": "PyTorchModel",
+        "model_path": "Prince-1/OmniVoice",
+        "model_loader": "get_audio_heads_model",
+        "model_script": "user_script.py",
+        "io_config": "get_audio_heads_io_config",
+        "dummy_inputs_func": "get_audio_heads_dummy_inputs"
+    },
+    "passes": {
+        "convert": {
+            "type": "OnnxConversion",
+            "use_dynamo_exporter": false
+        },
+        "ort": {
+            "type": "OrtTransformersOptimization",
+            "model_type": "",
+            "opt_level": 1,
+            "only_onnxruntime": true
+        },
+        "cast": {
+            "type": "OnnxPeepholeOptimizer",
+            "onnxscript_optimize": false,
+            "onnxoptimizer_optimize": false,
+            "fuse_reshape_operations": false,
+            "fix_com_microsoft_opset": true,
+            "cast_chain_elimination": true
+        },
+        "fp16": {
+            "type": "OnnxFloatToFloat16",
+            "save_as_external_data": false
+        }
+    },
+    "engine": {
+        "target": {
+            "type": "LocalSystem",
+            "accelerators": [{ "device": "gpu", "execution_providers": ["CUDAExecutionProvider"] }]
+        }
+    },
+    "no_artifacts": true,
+    "output_dir": "cuda/models/audio_heads_decoder.onnx"
+}

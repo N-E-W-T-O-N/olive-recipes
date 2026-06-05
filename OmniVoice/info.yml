@@ -1,0 +1,14 @@
+keywords:
+  - olive-ai
+  - tts
+  - speech-synthesis
+recipes:
+  - name: OmniVoice
+    file: optimize.py
+    eps:
+      - CPUExecutionProvider
+      - CUDAExecutionProvider
+    devices:
+      - cpu
+      - cpu_fp16
+      - gpu

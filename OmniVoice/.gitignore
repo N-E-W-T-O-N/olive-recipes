@@ -4,5 +4,6 @@ cpu_fp16/models/
 cpu_fp16/qwen3_standalone/
 cuda/models/
 cuda/qwen3_standalone/
+higgs/models/
 __pycache__/
 *.pyc

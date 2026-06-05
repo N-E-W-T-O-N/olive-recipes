@@ -39,8 +39,42 @@ def _load_base_model(model_path):
     # Create custom model and load weights in bfloat16 (native dtype)
     custom_model = Qwen3VLModel(config)
     result = custom_model.load_state_dict(state_dict, strict=False)
+
     if result.missing_keys:
-        print(f"Warning: {len(result.missing_keys)} missing keys")
+        # Categorise missing keys so we can distinguish harmless vs critical
+        # Non-persistent buffers (inv_freq) are computed correctly in __init__
+        # and are never saved in HF checkpoints — always expected to be missing.
+        inv_freq_keys   = [k for k in result.missing_keys if "inv_freq" in k]
+        missing_embed   = [k for k in result.missing_keys if "embed_tokens" in k]
+        missing_decoder = [k for k in result.missing_keys
+                           if k.startswith("language_model.layers.")]
+        missing_other   = [k for k in result.missing_keys
+                           if k not in inv_freq_keys + missing_embed + missing_decoder]
+
+        print(f"[LOAD] {len(result.missing_keys)} missing keys: "
+              f"inv_freq(expected)={len(inv_freq_keys)}, embed={len(missing_embed)}, "
+              f"decoder={len(missing_decoder)}, other={len(missing_other)}")
+
+        if inv_freq_keys:
+            # inv_freq is non-persistent in HF checkpoints; our model registers
+            # it as persistent=True so __init__ computes the correct value.
+            print(f"  [OK] inv_freq buffers absent from checkpoint — "
+                  f"__init__ values are correct: {inv_freq_keys}")
+        if missing_embed:
+            print(f"  [CRITICAL] Missing embed_tokens — embedding model will have wrong weights!")
+            print(f"    Keys: {missing_embed}")
+        if missing_decoder:
+            # Text decoder layers are NOT used in vision/embedding ONNX export.
+            # ModelBuilder handles the full text decoder via text.json directly from HF.
+            print(f"  [OK] {len(missing_decoder)} text decoder layer keys missing "
+                  f"(not needed for vision/embedding ONNX export)")
+        if missing_other:
+            print(f"  [WARN] Unexpected missing (first 5): {missing_other[:5]}")
+
+        if result.unexpected_keys:
+            print(f"[LOAD] {len(result.unexpected_keys)} unexpected keys "
+                  f"(first 3): {result.unexpected_keys[:3]}")
+
     custom_model = custom_model.to(torch.bfloat16)
     custom_model.eval()
 

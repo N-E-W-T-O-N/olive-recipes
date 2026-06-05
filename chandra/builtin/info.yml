@@ -1,0 +1,11 @@
+keywords:
+  - olive-ai
+recipes:
+  - name: chandra
+    file: optimize.py
+    eps:
+      - CPUExecutionProvider
+      - CUDAExecutionProvider
+    devices:
+      - cpu
+      - gpu

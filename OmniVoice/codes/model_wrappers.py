@@ -133,7 +133,9 @@ class AudioHeadsDecoderWrapper(nn.Module):
 
 SR_24K            = 24_000
 SR_16K            = 16_000
-DOWNSAMPLE_FACTOR = 320
+DOWNSAMPLE_FACTOR = 960   # product of DAC downsampling_ratios [8,5,4,2,3] → 24000/960=25 fps
+HIGGS_D_ACOUSTIC  = 256   # DAC acoustic encoder output channels (hidden_size in acoustic_model_config)
+HIGGS_D_SEMANTIC  = 768   # encoder_semantic output channels
 HIGGS_N_CB        = 8     # number of codebooks in the Higgs quantizer
 HIGGS_CB_SIZE     = 1024  # RVQ codebook size
 
@@ -216,22 +218,52 @@ class HiggsAcousticEncoderWrapper(nn.Module):
 class HiggsSemanticEncoderWrapper(nn.Module):
     """HuBERT semantic encoder: waveform_16k → semantic_features.
 
-    Input  : waveform_16k  (B, T_samples)  float32  [16 kHz audio, no channel dim]
-    Output : semantic_feat (B, D_semantic, T_frames)  float32
+    Replicates HiggsAudioV2TokenizerModel._extract_semantic_features() exactly:
+      1. Pad input (160, 160) samples — matches the real encode() call
+      2. Run HuBERT with output_hidden_states=True
+      3. Stack ALL 13 hidden states and average across layers
+         (NOT last_hidden_state — they differ significantly)
+      4. Downsample by semantic_downsample_factor=2 (every other frame)
+      5. Pass through encoder_semantic conv projection
 
-    Runs HuBERT then passes through encoder_semantic conv layers.
+    After this fix, output T_frames ≈ 25 for 1 s of audio, which naturally
+    matches the acoustic encoder's 25 fps — no interpolation needed at inference.
+
+    Input  : waveform_16k  (B, T_16k)  float32  [16 kHz, mono, no channel dim]
+             Caller resamples from 24 kHz to 16 kHz before passing here.
+    Output : semantic_features  (B, D_semantic=768, T_frames)  float32
     """
 
-    def __init__(self, semantic_model: "nn.Module", encoder_semantic: "nn.Module") -> None:
+    def __init__(
+        self,
+        semantic_model:    "nn.Module",
+        encoder_semantic:  "nn.Module",
+        downsample_factor: int = 2,
+        pad:               int = 160,
+    ) -> None:
         super().__init__()
         _strip_weight_norm(semantic_model)
         _strip_weight_norm(encoder_semantic)
-        self.semantic_model   = semantic_model
-        self.encoder_semantic = encoder_semantic
+        self.semantic_model    = semantic_model
+        self.encoder_semantic  = encoder_semantic
+        self.downsample_factor = downsample_factor
+        self.pad               = pad
 
     def forward(self, waveform_16k: torch.Tensor) -> torch.Tensor:
-        out    = self.semantic_model(waveform_16k)
-        hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+        # 1. Pad — matches _extract_semantic_features: F.pad(input_values, (160, 160))
+        x = torch.nn.functional.pad(waveform_16k, (self.pad, self.pad))
+
+        # 2. Run HuBERT collecting ALL hidden states (not just last)
+        out = self.semantic_model(x, output_hidden_states=True)
+
+        # 3. Average all hidden states across layers  (B, T, D)
+        #    Stacking a fixed-length tuple traces cleanly in ONNX.
+        hidden = torch.stack(list(out.hidden_states), dim=1).mean(dim=1)
+
+        # 4. Temporal downsample by factor 2  →  T_frames ≈ 25 for 1 s
+        hidden = hidden[:, :: self.downsample_factor, :]
+
+        # 5. encoder_semantic conv projection  (B, T, D) → transpose → conv → (B, D, T)
         return self.encoder_semantic(hidden.transpose(1, 2))
 
 
@@ -260,13 +292,13 @@ class HiggsQuantizerEncoderWrapper(nn.Module):
 
     def forward(
         self,
-        acoustic_feat: torch.Tensor,   # (B, D_a, T)
-        semantic_feat: torch.Tensor,   # (B, D_s, T)
-    ) -> torch.Tensor:                 # (N_Q, B, T)
+        acoustic_features: torch.Tensor,   # (B, D_a, T)
+        semantic_features: torch.Tensor,   # (B, D_s, T)
+    ) -> torch.Tensor:                     # (N_Q, B, T)
         if self.merge_mode == "concat":
-            merged = torch.cat([acoustic_feat, semantic_feat], dim=1)
+            merged = torch.cat([acoustic_features, semantic_features], dim=1)
         else:
-            merged = acoustic_feat + semantic_feat
+            merged = acoustic_features + semantic_features
         z = self.fc_prior(merged.transpose(1, 2)).transpose(1, 2)
         return self.quantizer.encode(z)
 

@@ -10,7 +10,9 @@
     "passes": {
         "convert": {
             "type": "OnnxConversion",
-            "use_dynamo_exporter": false
+            "use_dynamo_exporter": false,
+            "torch_dtype": "float32",
+            "target_opset": 20
         },
         "ort": {
             "type": "OrtTransformersOptimization",
@@ -25,10 +27,6 @@
             "fuse_reshape_operations": false,
             "fix_com_microsoft_opset": true,
             "cast_chain_elimination": true
-        },
-        "fp16": {
-            "type": "OnnxFloatToFloat16",
-            "save_as_external_data": false
         }
     },
     "no_artifacts": true,

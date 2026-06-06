@@ -10,7 +10,8 @@
     "passes": {
         "convert": {
             "type": "OnnxConversion",
-            "use_dynamo_exporter": false
+            "use_dynamo_exporter": false,
+            "opset_version": 20
         },
         "ort": {
             "type": "OrtTransformersOptimization",

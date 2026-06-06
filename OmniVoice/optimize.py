@@ -294,10 +294,8 @@ def write_inference_manifest(output_dir: str, device: str = "cpu"):
                 "  --- TTS inference: codes → audio_embeddings_encoder → ... → audio_codes ---",
                 "higgs_decoder(audio_codes) → waveform_24k",
             ],
-            "loading_priority": [
-                "transformers.HiggsAudioV2TokenizerModel (transformers>=5.3.0)",
-                "boson_multimodal.load_higgs_audio_tokenizer (pip install boson-multimodal @ git+...)",
-            ],
+            "loading": "transformers.AutoModel (transformers>=5.4.0, no external deps needed)",
+            "docs": "https://huggingface.co/docs/transformers/v5.4.0/en/model_doc/higgs_audio_v2_tokenizer",
         },
         "iterative_decoding": {
             "note": "OmniVoice uses 32-step iterative unmasking (non-autoregressive).",

@@ -12,9 +12,9 @@ Higgs Audio V2 Tokenizer (Olive JSON configs in higgs/):
   - get_higgs_quantizer_model    → quantizer_encoder.onnx
   - get_higgs_decoder_model      → higgs_decoder.onnx
 
-Higgs loading tries transformers.HiggsAudioV2TokenizerModel first (transformers>=5.3),
-then falls back to boson_multimodal (pip install boson-multimodal @
-git+https://github.com/boson-ai/higgs-audio.git).
+HiggsAudioV2TokenizerModel is natively in transformers >= 5.4.0 —
+no external packages needed.
+https://huggingface.co/docs/transformers/v5.4.0/en/model_doc/higgs_audio_v2_tokenizer
 
 The DAC acoustic encoder and decoder contain Python control-flow branches that
 torch.onnx.export cannot resolve without pre-tracing. get_higgs_acoustic_model
@@ -28,7 +28,7 @@ OmniVoice backbone constants (from config.json):
 Higgs Audio constants (from audio_tokenizer/config.json + preprocessor_config.json):
   SR_24K = 24 000 Hz   (acoustic sample rate)
   SR_16K = 16 000 Hz   (HuBERT semantic sample rate)
-  DOWNSAMPLE_FACTOR = 320  (24 kHz samples → codec frames)
+  DOWNSAMPLE_FACTOR = 960  (product of DAC downsampling_ratios [8,5,4,2,3]; 24000/960=25 fps)
 """
 
 import os
@@ -209,7 +209,8 @@ from codes.model_wrappers import (
     HiggsSemanticEncoderWrapper,
     HiggsQuantizerEncoderWrapper,
     HiggsDecoderWrapper,
-    SR_24K, SR_16K, DOWNSAMPLE_FACTOR, HIGGS_N_CB, HIGGS_CB_SIZE,
+    SR_24K, SR_16K, DOWNSAMPLE_FACTOR,
+    HIGGS_D_ACOUSTIC, HIGGS_D_SEMANTIC, HIGGS_N_CB, HIGGS_CB_SIZE,
 )
 
 _AUDIO_TOK_SUBDIR = "audio_tokenizer"   # relative to OmniVoice model root
@@ -218,15 +219,22 @@ _AUDIO_TOK_SUBDIR = "audio_tokenizer"   # relative to OmniVoice model root
 def _load_higgs_tokenizer(model_path: str):
     """Load HiggsAudioV2TokenizerModel from the audio_tokenizer/ subfolder.
 
-    Resolution order:
-    1. transformers.HiggsAudioV2TokenizerModel (transformers >= 5.3.0)
-    2. boson_multimodal.load_higgs_audio_tokenizer (external package)
+    HiggsAudioV2TokenizerModel is natively supported in transformers >= 5.4.0
+    (https://huggingface.co/docs/transformers/v5.4.0/en/model_doc/higgs_audio_v2_tokenizer).
+    No external packages (boson_multimodal etc.) are required.
 
-    Returns the tokenizer object with .encode, .encoder_semantic,
-    .semantic_model, .fc_prior, .quantizer, .fc_post2, .decoder attributes.
+    Transformers attribute mapping used by our wrappers:
+      tok.acoustic_encoder  — DAC acoustic encoder (nn.Module)
+      tok.semantic_model    — HuBERT model (nn.Module)
+      tok.encoder_semantic  — semantic projection conv (nn.Module)
+      tok.fc                — linear projection before RVQ (nn.Module)
+      tok.quantizer         — HiggsAudioV2TokenizerResidualVectorQuantization
+      tok.fc2               — linear projection after RVQ decode (nn.Module)
+      tok.acoustic_decoder  — DAC decoder (nn.Module)
     """
     from huggingface_hub import snapshot_download
     from pathlib import Path
+    from transformers import AutoModel
 
     # Resolve the model root directory
     local_root = Path(model_path)
@@ -240,36 +248,13 @@ def _load_higgs_tokenizer(model_path: str):
             "The full OmniVoice model must be downloaded (not just config.json)."
         )
 
-    # --- Try transformers first (no external deps) ---
-    try:
-        from transformers import AutoModel
-        tok = AutoModel.from_pretrained(
-            str(audio_tok_dir),
-            trust_remote_code=True,
-            torch_dtype=torch.float32,
-        )
-        tok.eval()
-        print(f"  [Higgs] Loaded via transformers AutoModel from {audio_tok_dir}")
-        return tok
-    except Exception as e_tf:
-        print(f"  [Higgs] transformers load failed ({type(e_tf).__name__}: {e_tf})")
-
-    # --- Fall back to boson_multimodal ---
-    try:
-        from boson_multimodal.audio_processing.higgs_audio_tokenizer import (
-            load_higgs_audio_tokenizer,
-        )
-        tok = load_higgs_audio_tokenizer(str(audio_tok_dir), device="cpu")
-        tok.eval()
-        print(f"  [Higgs] Loaded via boson_multimodal from {audio_tok_dir}")
-        return tok
-    except ImportError:
-        raise ImportError(
-            "Cannot load HiggsAudioV2TokenizerModel. Install one of:\n"
-            "  pip install transformers>=5.3.0\n"
-            "  pip install boson-multimodal @ "
-            "git+https://github.com/boson-ai/higgs-audio.git"
-        )
+    tok = AutoModel.from_pretrained(
+        str(audio_tok_dir),
+        torch_dtype=torch.float32,
+    )
+    tok.eval()
+    print(f"  [Higgs] Loaded HiggsAudioV2TokenizerModel from {audio_tok_dir}")
+    return tok
 
 
 # ---------------------------------------------------------------------------
@@ -344,16 +329,22 @@ def get_higgs_acoustic_dummy_inputs(model=None):
 # ---------------------------------------------------------------------------
 
 def get_higgs_semantic_model(model_path=None):
-    """HuBERT semantic encoder — no Python control flow issues, no pre-trace needed.
+    """HuBERT semantic encoder — replicates _extract_semantic_features() exactly.
 
-    tok.semantic_model and tok.encoder_semantic are nn.Modules, so
-    HiggsSemanticEncoderWrapper strips weight_norm on them directly in __init__.
-    We still call _prepare_tok first to ensure the full tokenizer is clean
-    before extracting sub-modules.
+    Passes downsample_factor and pad from tok.config so the wrapper matches
+    the real encode() pipeline precisely:
+      - pad=160      : F.pad(input_values, (160, 160)) before HuBERT
+      - all hidden states averaged (not last_hidden_state)
+      - downsample_factor=2 : every-other-frame slice after averaging
     """
     tok = _load_higgs_tokenizer(model_path or model_name)
     tok = _prepare_tok(tok)
-    wrapper = HiggsSemanticEncoderWrapper(tok.semantic_model, tok.encoder_semantic)
+    wrapper = HiggsSemanticEncoderWrapper(
+        tok.semantic_model,
+        tok.encoder_semantic,
+        downsample_factor=getattr(tok.config, "semantic_downsample_factor", 2),
+        pad=160,   # hardcoded in _extract_semantic_features: F.pad(..., (160, 160))
+    )
     wrapper.eval()
     return wrapper
 
@@ -409,14 +400,18 @@ def get_higgs_quantizer_io_config(model_path=None):
 
 
 def get_higgs_quantizer_dummy_inputs(model=None):
-    """Dummy feature tensors for 1 second at 75 fps (24000 / 320)."""
-    T = SR_24K // DOWNSAMPLE_FACTOR   # 75 frames/sec
-    # Feature dims: we don't know D_a / D_s exactly without loading the model,
-    # so use plausible defaults (acoustic=64, semantic=256 from acoustic_model_config)
-    D_a, D_s = 64, 256
+    """Dummy feature tensors for 1 second of audio.
+
+    DAC acoustic encoder: 24000 / 960 = 25 frames/sec  (DOWNSAMPLE_FACTOR=960)
+    HIGGS_D_ACOUSTIC=256, HIGGS_D_SEMANTIC=768 confirmed from model inspection.
+    tok.fc.in_features = 256 + 768 = 1024 (concat along channel dim).
+    Both acoustic and semantic features are passed with the same T (acoustic rate)
+    since the quantizer pipeline aligns them at inference time.
+    """
+    T = SR_24K // DOWNSAMPLE_FACTOR   # 25 frames/sec
     return {
-        "acoustic_features": torch.randn(1, D_a, T, dtype=torch.float32),
-        "semantic_features": torch.randn(1, D_s, T, dtype=torch.float32),
+        "acoustic_features": torch.randn(1, HIGGS_D_ACOUSTIC, T, dtype=torch.float32),
+        "semantic_features": torch.randn(1, HIGGS_D_SEMANTIC, T, dtype=torch.float32),
     }
 
 
@@ -457,8 +452,8 @@ def get_higgs_decoder_io_config(model_path=None):
 
 
 def get_higgs_decoder_dummy_inputs(model=None):
-    """Dummy codec codes for 1 second of audio (75 frames)."""
-    T = SR_24K // DOWNSAMPLE_FACTOR
+    """Dummy codec codes for 1 second of audio (25 frames at 24kHz / hop=960)."""
+    T = SR_24K // DOWNSAMPLE_FACTOR   # 25 frames/sec
     return {
         "codes": torch.randint(0, HIGGS_CB_SIZE, (HIGGS_N_CB, 1, T), dtype=torch.int64)
     }

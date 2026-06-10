@@ -1,0 +1,6 @@
+arch: sarvam_moe
+recipes:
+  - name: sarvamai-sarvam-30b_webgpu_int4
+    file: sarvamai-sarvam-30b_webgpu_int4.json
+    devices: gpu
+    eps: WebGpuExecutionProvider

@@ -1,0 +1,30 @@
+# CSM-1B evaluation dependencies
+# Install with: pip install -r requirements.txt
+
+# Core
+torch>=2.1.0
+torchaudio>=2.1.0
+transformers>=4.50.0
+
+# Olive (for conversion)
+olive-ai
+
+# ONNX inference
+onnxruntime          # CPU
+# onnxruntime-gpu    # GPU (uncomment if using CUDA)
+
+# WER / CER
+openai-whisper
+jiwer
+
+# Automated MOS prediction
+utmos
+
+# Mel Cepstral Distortion
+pymcd
+
+# Speaker similarity
+speechbrain
+
+# Report formatting
+tabulate

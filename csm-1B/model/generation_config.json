@@ -1,0 +1,11 @@
+{
+  "bos_token_id": 128000,
+  "depth_decoder_do_sample": true,
+  "depth_decoder_temperature": 0.9,
+  "depth_decoder_top_k": 50,
+  "do_sample": true,
+  "max_new_tokens": 125,
+  "pad_token_id": 128002,
+  "temperature": 0.9,
+  "transformers_version": "4.52.0.dev0"
+}

@@ -1,0 +1,36 @@
+{
+    "input_model": {
+        "type": "PyTorchModel",
+        "model_path": "model",
+        "model_loader": "get_csm_model",
+        "model_script": "user_script.py",
+        "io_config": "get_csm_io_config",
+        "dummy_inputs_func": "get_csm_dummy_inputs"
+    },
+    "systems": {
+        "local_system": {
+            "type": "LocalSystem",
+            "accelerators": [
+                {
+                    "device": "gpu",
+                    "execution_providers": ["CUDAExecutionProvider"]
+                }
+            ]
+        }
+    },
+    "passes": {
+        "c": {
+            "type": "OnnxConversion",
+            "target_opset": 17,
+            "device": "gpu"
+        },
+        "f": {
+            "type": "OnnxFloatToFloat16"
+        }
+    },
+    "target": "local_system",
+    "log_severity_level": 0,
+    "output_dir": "model/cuda_fp16",
+    "cache_dir": "cache",
+    "no_artifacts": true
+}

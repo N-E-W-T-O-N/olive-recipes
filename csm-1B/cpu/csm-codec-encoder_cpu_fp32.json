@@ -1,0 +1,34 @@
+{
+    "input_model": {
+        "type": "PyTorchModel",
+        "model_path": "model",
+        "model_loader": "get_codec_encoder_model",
+        "model_script": "user_script.py",
+        "io_config": "get_codec_encoder_io_config",
+        "dummy_inputs_func": "get_codec_encoder_dummy_inputs"
+    },
+    "systems": {
+        "local_system": {
+            "type": "LocalSystem",
+            "accelerators": [
+                {
+                    "device": "cpu",
+                    "execution_providers": [
+                        "CPUExecutionProvider"
+                    ]
+                }
+            ]
+        }
+    },
+    "passes": {
+        "c": {
+            "type": "OnnxConversion",
+            "target_opset": 20
+        }
+    },
+    "target": "local_system",
+    "log_severity_level": 0,
+    "output_dir": "onnx/cpu_fp32/codec_encoder",
+    "cache_dir": "cache",
+    "no_artifacts": true
+}

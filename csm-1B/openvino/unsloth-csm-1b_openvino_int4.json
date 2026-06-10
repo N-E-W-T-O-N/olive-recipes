@@ -1,0 +1,38 @@
+{
+    "input_model": {
+        "type": "HfModel",
+        "model_path": "model",
+        "task": "feature-extraction",
+        "dtype": "float32"
+    },
+    "systems": {
+        "local_system": {
+            "type": "LocalSystem",
+            "accelerators": [
+                {
+                    "device": "cpu",
+                    "execution_providers": ["OpenVINOExecutionProvider"]
+                }
+            ]
+        }
+    },
+    "passes": {
+        "ov": {
+            "type": "OpenVINOConversion"
+        },
+        "q": {
+            "type": "OpenVINOQuantization",
+            "bits": 4,
+            "sym": false,
+            "group_size": 128,
+            "ratio": 1.0,
+            "dataset": "wikitext2",
+            "num_samples": 128
+        }
+    },
+    "target": "local_system",
+    "log_severity_level": 0,
+    "output_dir": "model/openvino_int4",
+    "cache_dir": "cache",
+    "no_artifacts": true
+}

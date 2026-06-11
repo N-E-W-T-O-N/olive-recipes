@@ -1,0 +1,11 @@
+# Higgs-Audio-v3 → ONNX (CPU INT4) build/run/eval dependencies
+olive-ai
+onnxruntime>=1.20
+onnxruntime-genai           # ModelBuilder (create_model) for the Qwen3 LLM sub-part
+torch
+transformers>=5.10
+boson-multimodal            # Higgs audio tokenizer (acoustic/semantic encoder, quantizer, decoder)
+safetensors
+numpy
+soundfile
+librosa

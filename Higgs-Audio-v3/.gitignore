@@ -1,0 +1,12 @@
+# Downloaded checkpoint + intermediate/build artifacts
+model/
+cache/
+cpu_int4/models/*.onnx
+cpu_int4/models/*.onnx.data
+_genai_*/
+__pycache__/
+*.pyc
+#codes/          # downloaded sglang-omni reference source (porting reference, not imported)
+onnx/*/_ocache/
+onnx/*/_gbuild/
+onnx/*/_llm_tmp/

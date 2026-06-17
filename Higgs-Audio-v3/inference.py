@@ -73,33 +73,12 @@ class Pipeline:
         self.root = Path(model_path)
         self.manifest = json.loads((self.root / "manifest.json").read_text())
         sm = self.manifest["sub_models"]
-
-        # Resolve the requested EP against what's actually installed; fall back to CPU
-        # with a clear message (e.g. an openvino_* build run in a CPU-only env).
-        want = self.manifest.get("execution_provider", "CPUExecutionProvider")
-        avail = ort.get_available_providers()
-        if want in avail:
-            if want == "OpenVINOExecutionProvider":
-                # device_type CPU/GPU/NPU/AUTO from the manifest (Intel NPU = "NPU")
-                ov_dev = self.manifest.get("ov_device_type", "CPU")
-                providers = [(want, {"device_type": ov_dev}), "CPUExecutionProvider"]
-                self.active_ep = f"OpenVINO:{ov_dev}"
-            elif want != "CPUExecutionProvider":
-                providers = [want, "CPUExecutionProvider"]
-                self.active_ep = want
-            else:
-                providers = ["CPUExecutionProvider"]
-                self.active_ep = "CPUExecutionProvider"
-        else:
-            providers = ["CPUExecutionProvider"]
-            self.active_ep = "CPUExecutionProvider"
-            print(f"[inference] '{want}' not available ({avail}); falling back to "
-                  f"CPUExecutionProvider. (Install a matching onnxruntime build to use {want}.)")
+        prov = self.manifest.get("execution_provider", "CPUExecutionProvider")
 
         def sess(name):
             if name not in sm:
                 return None
-            return ort.InferenceSession(str(self.root / sm[name]["filename"]), providers=providers)
+            return ort.InferenceSession(str(self.root / sm[name]["filename"]), providers=[prov])
 
         self.llm = sess("llm_decoder")
         if self.llm is not None:
@@ -112,13 +91,20 @@ class Pipeline:
         # text embedding + tokenizer (only needed for the text/LLM path)
         self.embed, self.tok = None, None
         std = self.standalone_dir()
-        if (std / "model.safetensors").exists():
-            with safe_open(str(std / "model.safetensors"), framework="pt") as f:
+        emb_file = std / "model.safetensors" if std else None
+        if emb_file and emb_file.exists():
+            with safe_open(str(emb_file), framework="pt") as f:
                 self.embed = f.get_tensor("model.embed_tokens.weight").float().numpy()
-            try:
-                self.tok = AutoTokenizer.from_pretrained(str(std), fix_mistral_regex=True)
-            except TypeError:
-                self.tok = AutoTokenizer.from_pretrained(str(std))
+        # tokenizer: prefer the standalone dir, else the model dir itself (tokenizer.json
+        # is shipped alongside the ONNX parts), so the text path doesn't depend on the
+        # 1.5 GB embedding being present.
+        for cand in [std, self.root]:
+            if cand and (cand / "tokenizer.json").exists():
+                try:
+                    self.tok = AutoTokenizer.from_pretrained(str(cand), fix_mistral_regex=True)
+                except TypeError:
+                    self.tok = AutoTokenizer.from_pretrained(str(cand))
+                break
 
     # ---- LLM with KV cache ----
     def _empty_past(self):
@@ -136,8 +122,27 @@ class Pipeline:
                     for i in range(self.n_layers) for kv in ("key", "value")}
         return hidden, new_past
 
-    def standalone_dir(self) -> Path:
-        return (self.root / self.manifest.get("standalone_dir", "../../qwen3_standalone")).resolve()
+    def standalone_dir(self):
+        """Locate the extracted Qwen3 dir (model.embed_tokens.weight + tokenizer).
+
+        The manifest's relative `standalone_dir` assumes onnx/{dev}_{prec}/ nesting;
+        flat layouts (model dir == cpu_int4/) break that path. Search several
+        candidates and return the first that actually holds model.safetensors, else
+        the first that holds a tokenizer, else None.
+        """
+        cands = [
+            self.root / "qwen3_standalone",
+            self.root / self.manifest.get("standalone_dir", "../../qwen3_standalone"),
+            self.root,
+        ]
+        cands = [c.resolve() for c in cands]
+        for c in cands:
+            if (c / "model.safetensors").exists():
+                return c
+        for c in cands:
+            if (c / "tokenizer.json").exists():
+                return c
+        return None
 
     # ---- text-path helpers (parity / eval) ----
     def hidden_states(self, input_ids: np.ndarray) -> np.ndarray:
@@ -189,6 +194,14 @@ class Pipeline:
     def generate_speech(self, text: str, max_frames: int = 600,
                         temperature: float = 0.8, top_k: int = 50,
                         seed: int = 0, max_repeat: int = 32) -> np.ndarray:
+        if self.tok is None or self.embed is None:
+            raise RuntimeError(
+                "Text→speech needs the standalone Qwen3 dir (tokenizer + "
+                "model.embed_tokens.weight). Searched: "
+                f"{self.root/'qwen3_standalone'}, {self.root}. "
+                "Run _fetch_embed.py (or optimize.py's extract step) to create "
+                "qwen3_standalone/model.safetensors. The --selftest codec path "
+                "works without it.")
         ids = self._tts_prompt_ids(text)
         rng = np.random.default_rng(seed)
 
@@ -253,8 +266,7 @@ def main():
     import soundfile as sf
 
     pipe = Pipeline(args.model_path)
-    print(f"Loaded {args.model_path} (device={pipe.manifest['device']}, "
-          f"precision={pipe.manifest['precision']}, running on {pipe.active_ep})")
+    print(f"Loaded {args.model_path} (device={pipe.manifest['device']}, precision={pipe.manifest['precision']})")
     print(f"sub-parts: {list(pipe.manifest['sub_models'])}")
 
     if args.selftest:

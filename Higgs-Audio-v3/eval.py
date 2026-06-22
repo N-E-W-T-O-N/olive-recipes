@@ -41,7 +41,14 @@ def main():
     from transformers import AutoModelForCausalLM
 
     pipe = Pipeline(args.model_path)
-    ref_dir = str(pipe.standalone_dir())
+    std = pipe.standalone_dir()
+    if std is None or not (std / "model.safetensors").exists() or pipe.embed is None:
+        raise SystemExit(
+            "eval.py needs the PyTorch reference (qwen3_standalone/model.safetensors with "
+            "the Qwen3 weights). It is a build artifact of the LLM export — re-run "
+            "`python optimize.py --components llm_decoder` (keeps qwen3_standalone), or place "
+            "it next to the model dir. (inference.py does NOT need it; eval does.)")
+    ref_dir = str(std)
     print(f"Loading PyTorch reference Qwen3 from {ref_dir} ...")
     ref = AutoModelForCausalLM.from_pretrained(ref_dir, dtype=torch.float32).eval()
 

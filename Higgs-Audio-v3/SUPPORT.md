@@ -26,54 +26,17 @@ not verified here and some ops fall back to fp32. int4 or fp32 are the safe CPU 
 `optimize.py` currently exposes `--device {cpu,cuda}` × `--precision {int4,fp16,fp32}`.
 
 ## Intel / OpenVINO — how to actually enable it
-`optimize.py --device openvino` builds the **same EP-agnostic ONNX as CPU** (genai LLM
-on CPU int4; audio parts via Olive on CPU) and writes a manifest tagged
-`OpenVINOExecutionProvider` → `onnx/openvino_int4/`. No rebuild needed to switch EPs.
+The exported ONNX is EP-agnostic, so **inference** can target Intel CPU/iGPU/NPU via
+OpenVINO without rebuilding — but the OpenVINO **runtime** must be installed (currently
+missing, so it falls back to CPU):
 
-**Running on OpenVINO is an environment swap, not just `pip install openvino`:**
-- The OpenVINO EP ships **only** in the `onnxruntime-openvino` wheel — a *full*
-  onnxruntime build. It and plain `onnxruntime` install into the same namespace and
-  **cannot coexist**: a mismatched pair hard-fails every ORT session with
-  `Error 127: The specified procedure could not be found` (we hit exactly this with
-  `onnxruntime` 1.26 + a stale `onnxruntime-openvino` 1.24.1 dll — it broke even CPU
-  builds until removed).
-- Correct setup (in a dedicated env): install a **single matching set** —
-  `onnxruntime-openvino==<ver>` (replacing plain `onnxruntime`) + a compatible
-  `openvino` runtime — and re-check `onnxruntime-genai` still imports (it depends on
-  onnxruntime). Then `OpenVINOExecutionProvider` appears in
-  `ort.get_available_providers()` and the audio ONNX runs on Intel CPU/iGPU/NPU.
-- This repo's default env uses plain `onnxruntime` (CPU/CUDA) + `onnxruntime-genai`;
-  OpenVINO is opt-in via the swap above.
-
-### Choosing the OpenVINO device (`--ov-device`)
-`optimize.py --device openvino --ov-device {CPU,GPU,NPU,AUTO}` writes the chosen
-`device_type` into `genai_config.json` (`{"OpenVINO": {"device_type": ...}}`) and the
-manifest (`ov_device_type`). `inference.py` passes it through when the OpenVINO EP is
-present; otherwise it cleanly falls back to CPU.
-
-### Intel NPU (`--ov-device NPU`)
-Requirements: **Intel NPU driver** + `openvino` runtime (with the NPU plugin) +
-a matching `onnxruntime-openvino` (the env swap above).
-
-Honest caveats — the NPU is great for the **small audio sub-parts**, less so for the
-4B LLM:
-- **Static shapes:** the NPU plugin wants fixed input shapes. Our audio_embed/heads and
-  codec use dynamic axes (seq/frames); the NPU may recompile per shape or reject them.
-  The codec already exports with a static time axis; the LLM/audio seq axes are dynamic.
-- **Precision:** NPU targets **fp16/int8**, not int4 GQA. The 4B **int4 `llm_decoder`
-  is unlikely to run natively on NPU.**
-- **Recommended: `--ov-device AUTO`** (or `AUTO:NPU,CPU`) so OpenVINO runs what the NPU
-  supports there and offloads the rest (the int4 LLM) to CPU/GPU automatically. Pure
-  `NPU` for the whole pipeline will likely error on the LLM.
-- Best realistic split: audio sub-parts on **NPU**, `llm_decoder` on **CPU/GPU**. That
-  needs per-sub-part EPs (one `device_type` per session) — a small follow-up if you
-  want it; today the manifest uses one `device_type` for all parts.
-
-Build a NPU-targeted bundle:
 ```
-python optimize.py --device openvino --precision int4 --ov-device NPU   # → onnx/openvino_int4/
-# (or --ov-device AUTO for NPU-with-CPU-fallback, recommended for the 4B LLM)
+uv pip install openvino                 # provides openvino.dll the EP depends on
 ```
+Then point the manifest's `execution_provider` at `OpenVINOExecutionProvider` (or pass
+providers explicitly in `inference.py`). The genai `llm_decoder` runs through
+onnxruntime-genai (CPU/OpenVINO-CPU); `audio_embed/heads/tokenizer` run under the
+OpenVINO EP directly.
 
 For an **OpenVINO-optimized build** (not just EP inference), Olive ships native
 OpenVINO passes — available in this install:

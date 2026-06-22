@@ -36,7 +36,8 @@ from pathlib import Path
 MODEL_NAME = "bosonai/higgs-audio-v3-tts-4b"
 MODEL_DIR = "model"
 STANDALONE_DIR = "qwen3_standalone"          # top-level
-ALL_COMPONENTS = ["llm_decoder", "audio_embed", "audio_heads", "audio_tokenizer"]
+ALL_COMPONENTS = ["llm_decoder", "text_embed", "audio_embed", "audio_heads",
+                  "audio_tokenizer", "audio_encoder"]
 
 # ModelBuilder (onnxruntime-genai) execution_provider for the LLM build.
 # genai has no OpenVINO EP, so 'openvino' builds the LLM as a CPU int4 model
@@ -55,12 +56,16 @@ OLIVE_ACCEL = {"cpu": ("cpu", "CPUExecutionProvider"),
                "openvino": ("cpu", "CPUExecutionProvider")}
 
 AUDIO_FUNCS = {
+    "text_embed": ("get_text_embed_model", "get_text_embed_io_config",
+                   "get_text_embed_dummy_inputs"),
     "audio_embed": ("get_audio_embed_model", "get_audio_embed_io_config",
                     "get_audio_embed_dummy_inputs"),
     "audio_heads": ("get_audio_heads_model", "get_audio_heads_io_config",
                     "get_audio_heads_dummy_inputs"),
     "audio_tokenizer": ("get_audio_tokenizer_model", "get_audio_tokenizer_io_config",
                         "get_audio_tokenizer_dummy_inputs"),
+    "audio_encoder": ("get_audio_encoder_model", "get_audio_encoder_io_config",
+                      "get_audio_encoder_dummy_inputs"),
 }
 
 
@@ -181,8 +186,15 @@ def build_audio_part(component: str, model_path: str, out_dir: Path,
                      device: str, precision: str) -> None:
     from olive import run
     loader, io_cfg, dummy = AUDIO_FUNCS[component]
-    # neural codec stays fp32 even when the LLM is int4 (DAC int4 is too lossy)
-    prec = "fp32" if component == "audio_tokenizer" else precision
+    # neural codec stays fp32 even when the LLM is int4 (DAC int4 is too lossy).
+    # text_embed is a Gather (RTN int4 only quantizes MatMul, so int4 would leave it
+    # fp32 at 1.5 GB) → use fp16 instead to halve it; inference casts to fp32 anyway.
+    if component in ("audio_tokenizer", "audio_encoder"):
+        prec = "fp32"
+    elif component == "text_embed":
+        prec = "fp16" if precision == "int4" else precision
+    else:
+        prec = precision
     passes = {"c": {"type": "OnnxConversion", "target_opset": 20}}
     if prec == "int4":
         passes["q"] = {"type": "OnnxBlockwiseRtnQuantization", "bits": 4,
@@ -235,6 +247,12 @@ def write_manifest(out_dir: Path, device: str, precision: str, ov_device: str = 
             "vocab_size": 151936, "tie_word_embeddings": True,
             "note": "exclude_embeds+exclude_lm_head; text logits = hidden @ text_embedᵀ",
         }
+    if (out_dir / "text_embed.onnx").exists():
+        sm["text_embed"] = {"filename": "text_embed.onnx",
+            "io": {"inputs": ["input_ids[B,L] int64"], "outputs": ["inputs_embeds[B,L,2560]"]},
+            "vocab_size": 151936, "hidden_size": 2560,
+            "note": "token embedding Gather (the excluded llm embed) — makes the "
+                    "pipeline self-contained; no qwen3_standalone needed at runtime"}
     if (out_dir / "audio_embed.onnx").exists():
         sm["audio_embed"] = {"filename": "audio_embed.onnx",
             "io": {"inputs": ["codes[B,L,8] int64"], "outputs": ["audio_embeds[B,L,2560]"]},
@@ -250,9 +268,13 @@ def write_manifest(out_dir: Path, device: str, precision: str, ov_device: str = 
             "io": {"inputs": ["audio_codes[B,8,T] int64"], "outputs": ["waveform[B,1,L] f32"]},
             "sample_rate": 24000, "num_codebooks": 8,
             "note": "Higgs v2 codec decoder (codes→waveform), fp32"}
+    if (out_dir / "audio_encoder.onnx").exists():
+        sm["audio_encoder"] = {"filename": "audio_encoder.onnx",
+            "io": {"inputs": ["input_values[B,1,T] f32 @24k"], "outputs": ["audio_codes[B,8,frames] int64"]},
+            "sample_rate": 24000, "num_codebooks": 8,
+            "note": "Higgs v2 codec encoder (waveform→codes), fp32 — reference audio for voice cloning"}
     manifest = {"model_id": MODEL_NAME, "device": device, "precision": precision,
-                "execution_provider": PROVIDER[device],
-                "standalone_dir": "../../qwen3_standalone", "sub_models": sm}
+                "execution_provider": PROVIDER[device], "sub_models": sm}
     if device == "openvino":
         manifest["ov_device_type"] = ov_device   # CPU / GPU / NPU / AUTO
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -294,7 +316,7 @@ def main():
         print("=== LLM via ModelBuilder ===")
         build_llm(qwen3_abs, out_dir, args.device, args.precision, args.ov_device); print()
 
-    for comp in ("audio_embed", "audio_heads", "audio_tokenizer"):
+    for comp in ("text_embed", "audio_embed", "audio_heads", "audio_tokenizer", "audio_encoder"):
         if comp in args.components:
             print(f"=== {comp} via Olive ===")
             build_audio_part(comp, args.model_path, out_dir, args.device, args.precision); print()

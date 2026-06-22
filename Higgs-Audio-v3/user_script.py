@@ -129,6 +129,58 @@ def extract_qwen3_standalone(model_path: str, output_dir: str) -> str:
 
 
 # =============================================================================
+# Text embedding sub-part: input_ids → inputs_embeds  (makes the pipeline
+# self-contained — llm_decoder is built with exclude_embeds, so the embedding
+# Gather must ship as its own ONNX instead of relying on qwen3_standalone at
+# runtime). Weight = the same tied table used as the (excluded) lm_head.
+# =============================================================================
+
+TEXT_EMBED_KEY = "tied.embedding.text_embedding.weight"
+
+
+def _load_text_embed_weight(model_path: str) -> torch.Tensor:
+    from safetensors import safe_open
+    src = _resolve_model_dir(model_path)
+    idx_path = src / "model.safetensors.index.json"
+    if idx_path.exists():
+        shard = json.loads(idx_path.read_text())["weight_map"][TEXT_EMBED_KEY]
+    else:
+        shard = "model.safetensors"
+    with safe_open(str(src / shard), framework="pt") as f:
+        return f.get_tensor(TEXT_EMBED_KEY).float()
+
+
+class TextEmbed(nn.Module):
+    """input_ids [B, L] (int64) → inputs_embeds [B, L, D]  (plain Gather)."""
+    def __init__(self, weight: torch.Tensor):
+        super().__init__()
+        self.emb = nn.Embedding(weight.shape[0], weight.shape[1])
+        self.emb.weight = nn.Parameter(weight, requires_grad=False)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.emb(input_ids)
+
+
+def get_text_embed_model(model_path=None):
+    return TextEmbed(_load_text_embed_weight(model_path or MODEL_NAME)).eval()
+
+
+def get_text_embed_io_config(model=None):
+    return {
+        "input_names": ["input_ids"],
+        "output_names": ["inputs_embeds"],
+        "input_shapes": [[1, 16]],
+        "input_types": ["int64"],
+        "dynamic_axes": {"input_ids": {0: "batch", 1: "seq"},
+                         "inputs_embeds": {0: "batch", 1: "seq"}},
+    }
+
+
+def get_text_embed_dummy_inputs(model=None):
+    return {"input_ids": torch.randint(0, 1000, (1, 16), dtype=torch.int64)}
+
+
+# =============================================================================
 # Audio embed / head sub-parts (fused multi-codebook, tied)
 # =============================================================================
 #
@@ -280,6 +332,45 @@ class CodecDecoderWrapper(nn.Module):
         out = self.codec.decode(audio_codes, return_dict=False)
         wav = out[0] if isinstance(out, (tuple, list)) else out
         return wav
+
+
+class CodecEncoderWrapper(nn.Module):
+    """input_values [B, 1, T] float32 (24 kHz) → audio_codes [B, 8, frames] int64.
+
+    Reference→codes for VOICE CLONING (the <|ref_audio|> prompt segment). Mirrors
+    `HiggsAudioV2TokenizerModel.encode(...).audio_codes` (DAC-style encoder + RVQ).
+    """
+    def __init__(self, codec):
+        super().__init__()
+        self.codec = codec
+
+    def forward(self, input_values: torch.Tensor) -> torch.Tensor:
+        out = self.codec.encode(input_values)
+        codes = out.audio_codes if hasattr(out, "audio_codes") else (
+            out[0] if isinstance(out, (tuple, list)) else out)
+        return codes
+
+
+def get_audio_encoder_model(model_path=None):
+    codec = _load_higgs_codec(model_path or MODEL_NAME)
+    for p in codec.parameters():
+        p.requires_grad_(False)
+    return CodecEncoderWrapper(codec).eval()
+
+
+def get_audio_encoder_io_config(model=None):
+    return {
+        "input_names": ["input_values"],
+        "output_names": ["audio_codes"],
+        "input_shapes": [[1, 1, CODEC_SR]],          # 1 s; time axis dynamic below
+        "input_types": ["float32"],
+        "dynamic_axes": {"input_values": {0: "batch", 2: "samples"},
+                         "audio_codes": {0: "batch", 2: "frames"}},
+    }
+
+
+def get_audio_encoder_dummy_inputs(model=None):
+    return {"input_values": torch.randn(1, 1, CODEC_SR, dtype=torch.float32)}
 
 
 def get_audio_tokenizer_model(model_path=None):

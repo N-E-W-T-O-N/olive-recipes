@@ -1,6 +1,47 @@
 import argparse
 import json
+import re
+from pathlib import Path
+
 import onnxruntime_genai as og
+
+
+def describe_model(model_path: str):
+    """Infer (device, precision, execution_provider) from the model dir alone.
+
+    device/precision come from the `<device>_<precision>` folder name (cpu_int4,
+    cuda_fp16, …); the EP is read from genai_config.json's provider_options (and, if
+    the folder name is non-standard, precision is sniffed from text.onnx)."""
+    p = Path(model_path)
+    device = precision = None
+    for part in [p.name] + [a.name for a in p.parents]:
+        m = re.fullmatch(r"(cpu|cuda)_(int4|fp16|fp32)", part)
+        if m:
+            device, precision = m.group(1), m.group(2)
+            break
+
+    ep = "CPUExecutionProvider"
+    cfg_file = p / "genai_config.json"
+    if cfg_file.exists():
+        txt = cfg_file.read_text()
+        ep = "CUDAExecutionProvider" if '"cuda"' in txt else "CPUExecutionProvider"
+    if device is None:
+        device = "cuda" if ep == "CUDAExecutionProvider" else "cpu"
+
+    if precision is None:  # fall back to sniffing the text decoder weights
+        try:
+            import onnx
+            t = onnx.load(str(p / "text.onnx"), load_external_data=False)
+            ops = {n.op_type for n in t.graph.node}
+            if "MatMulNBits" in ops or "GatherBlockQuantized" in ops:
+                precision = "int4"
+            elif any(i.data_type == onnx.TensorProto.FLOAT16 for i in t.graph.initializer):
+                precision = "fp16"
+            else:
+                precision = "fp32"
+        except Exception:
+            precision = "unknown"
+    return device, precision, ep
 
 
 def main():
@@ -11,8 +52,9 @@ def main():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="cpu_and_mobile/models",
-        help="Path to the model directory containing genai_config.json and ONNX models"
+        default="cpu_int4/models",
+        help="Model dir with genai_config.json + ONNX models, e.g. cpu_int4/models, "
+             "cpu_fp16/models, cpu_fp32/models, cuda_fp16/models, cuda_fp32/models"
     )
     parser.add_argument(
         "--image",
@@ -35,7 +77,9 @@ def main():
     args = parser.parse_args()
 
     # Load model
+    device, precision, ep = describe_model(args.model_path)
     print(f"Loading model from: {args.model_path}")
+    print(f"  type: {device}  |  precision: {precision}  |  execution provider: {ep}")
     model = og.Model(args.model_path)
     processor = model.create_multimodal_processor()
     tokenizer = og.Tokenizer(model)

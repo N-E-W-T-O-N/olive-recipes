@@ -4,10 +4,21 @@ This example demonstrates how to convert [datalab-to/chandra](https://huggingfac
 
 Chandra is a vision-language model fine-tuned from [Qwen/Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct), sharing the same architecture (hidden_size=4096, 36 layers, patch_size=16). The key preprocessing difference is a larger pixel range: `min_pixels=65536`, `max_pixels=16777216` (vs 3136/12845056 in the base model).
 
-The pipeline exports three sub-models (vision encoder, text embedding, text decoder), applies graph optimizations (Cast chain elimination, Gemm→MatMul conversion), and quantizes or converts them depending on the target device:
+The pipeline exports three sub-models (vision encoder, text embedding, text decoder), applies graph optimizations (Cast chain elimination, Gemm→MatMul conversion), and quantizes/converts per **target = device × precision**.
 
-- **CPU/Mobile:** All three sub-models are quantized to INT4.
-- **CUDA:** The text decoder is INT4 (via ModelBuilder); the vision encoder and embedding model are FP16.
+### Build targets (`--device {cpu,cuda} --precision {int4,fp16,fp32}`)
+
+| Target | text decoder | vision + embedding | output dir |
+|--------|--------------|--------------------|------------|
+| `cpu_int4`  | INT4 | INT4 | `cpu_int4/models/`  |
+| `cpu_fp16`  | FP16 | FP16 | `cpu_fp16/models/`  |
+| `cpu_fp32`  | FP32 | FP32 (optimized float) | `cpu_fp32/models/` |
+| `cuda_fp16` | FP16 | FP16 | `cuda_fp16/models/` |
+| `cuda_fp32` | FP32 | FP32 | `cuda_fp32/models/` |
+
+- The **text decoder** is built with onnxruntime-genai **ModelBuilder (`create_model`) directly** — not via an Olive pass — because Olive's ModelBuilder pass restricts the cpu/precision combos (e.g. cpu + fp32). Calling `create_model` directly allows every device × precision.
+- The **vision encoder** and **embedding** are built via Olive (configs generated in-Python by `optimize.py`); the final pass is swapped per precision: INT4 `OnnxBlockWiseRtnQuantization`, FP16 `OnnxFloatToFloat16`, FP32 none.
+- ⚠️ **Size:** these are an 8B model — FP32 text ≈ 32 GB, FP16 ≈ 16 GB, INT4 ≈ 5 GB per target. Build only the targets you need.
 
 ## Architecture & Preprocessing Summary
 
@@ -46,29 +57,38 @@ Install ONNX Runtime GenAI based on your target device:
 
 ### 1. Export & Optimize Models
 
-All graph transformations and quantization are declared in the JSON config files inside `cpu_and_mobile/` and `cuda/`. The top-level `optimize.py` script orchestrates the three Olive runs and generates the GenAI runtime configs.
+`optimize.py` generates the Olive configs in-Python and orchestrates the three sub-model
+builds for a chosen `--device` × `--precision`. Output goes to `<device>_<precision>/models/`.
 
-| Command | Description |
-|---------|-------------|
-| `python optimize.py --config-dir cpu_and_mobile --device cpu` | Full pipeline: export, optimize, INT4 quantize (CPU) |
-| `python optimize.py --config-dir cuda --device gpu` | Full pipeline: INT4 text + FP16 embedding/vision (CUDA) |
-| `python optimize.py --config-dir cpu_and_mobile --skip-export` | Regenerate configs only (models already exported) |
+| Command | Target |
+|---------|--------|
+| `python optimize.py --device cpu  --precision int4` | `cpu_int4/models`  |
+| `python optimize.py --device cpu  --precision fp16` | `cpu_fp16/models`  |
+| `python optimize.py --device cpu  --precision fp32` | `cpu_fp32/models`  |
+| `python optimize.py --device cuda --precision fp16` | `cuda_fp16/models` |
+| `python optimize.py --device cuda --precision fp32` | `cuda_fp32/models` |
 
-> **Note:** The text model is exported as INT4 via ModelBuilder. The vision encoder and embedding model are quantized to INT4 (CPU) or kept at FP16 (CUDA).
->
-> The vision encoder is exported for a single image using the Dynamo exporter. At runtime, ONNX Runtime GenAI handles multiple images by calling the vision encoder once per image and concatenating the results.
+Subset / regen:
+```bash
+python optimize.py --device cpu --precision int4 --components vision     # one sub-model
+python optimize.py --device cpu --precision int4 --skip-export           # regen genai/processor configs only
+```
+
+> **Notes**
+> - The text decoder is built with **ModelBuilder (`create_model`) directly** — this is what makes cpu + fp32 possible (Olive's ModelBuilder pass restricts that combo).
+> - The vision encoder is exported for a single image with the Dynamo exporter; at runtime GenAI calls it once per image and concatenates results.
 
 ### 2. Run Inference
 
 ```bash
-# Text-only (CPU models, default)
+# Text-only (default cpu_int4/models)
 python inference.py --prompt "What is the capital of France?"
 
 # With a single image
 python inference.py --prompt "Describe this image" --image cat.jpeg
 
-# CUDA models
-python inference.py --model_path cuda/models --prompt "Describe this image" --image cat.jpeg
+# A specific target
+python inference.py --model_path cuda_fp16/models --prompt "Describe this image" --image cat.jpeg
 
 # Interactive mode
 python inference.py --interactive
@@ -89,15 +109,19 @@ python <onnxruntime-genai>/examples/python/model-mm.py \
 `eval.py` measures model quality on [AI2D](https://huggingface.co/datasets/lmms-lab/ai2d) — a multiple-choice visual QA benchmark on scientific diagrams.
 
 ```bash
-# ONNX only (fastest)
-python eval.py --num_samples 100
+# one target (default cpu_int4/models)
+python eval.py --num_samples 100 --model_path cpu_int4/models
 
-# ONNX + PyTorch comparison
-python eval.py --num_samples 100 --pytorch_model datalab-to/chandra
+# sweep + compare accuracy across several targets
+python eval.py --num_samples 100 \
+    --targets cpu_int4/models,cpu_fp16/models,cpu_fp32/models
 
-# Evaluate CUDA models
-python eval.py --model_path cuda/models --num_samples 100
+# ONNX + PyTorch reference comparison
+python eval.py --num_samples 100 --model_path cpu_int4/models --pytorch_model datalab-to/chandra
 ```
+
+`--targets` evaluates each model dir on the same AI2D subset and prints an accuracy +
+latency comparison — the quickest way to see the quality cost of each precision.
 
 ## Directory Structure
 
@@ -111,14 +135,10 @@ chandra/
     ├── inference.py               # ONNX Runtime GenAI inference
     ├── cat.jpeg                   # Sample test image
     ├── codes/                     # Custom Qwen3-VL PyTorch model adapted for ONNX export
-    ├── cpu_and_mobile/
-    │   ├── embedding.json         # Olive config: export → optimize → INT4
-    │   ├── vision.json            # Olive config: Dynamo export → graph surgeries → INT4
-    │   ├── text.json              # Olive config: ModelBuilder INT4
-    │   └── models/                # Exported ONNX models (generated)
-    └── cuda/
-        ├── embedding.json         # Olive config: export → optimize → FP16 + CUDA EP
-        ├── vision.json            # Olive config: Dynamo export → graph surgeries → FP16 + CUDA EP
-        ├── text.json              # ModelBuilder INT4 with CUDA EP
-        └── models/                # Exported CUDA ONNX models (generated)
+    └── <device>_<precision>/      # one per built target (generated)
+        └── models/                # text.onnx, embedding.onnx, vision.onnx,
+                                   #   genai_config.json, processor_config.json, tokenizer*
 ```
+
+Targets: `cpu_int4/  cpu_fp16/  cpu_fp32/  cuda_fp16/  cuda_fp32/`. Olive + ModelBuilder
+configs are generated in-Python by `optimize.py` — there are no static per-dir JSON config files.

@@ -12,20 +12,29 @@ if _script_dir not in sys.path:
 # Import custom model from codes directory
 from codes.modeling_qwen3_vl import Qwen3VLModel
 
-model_name = "datalab-to/chandra"
+# Resolve the model source: a local snapshot dir (set by optimize.py via
+# CHANDRA_MODEL_DIR) takes precedence over the HF repo id. from_pretrained accepts
+# either a local directory or a repo id transparently.
+model_name = os.environ.get("CHANDRA_MODEL_DIR") or "datalab-to/chandra"
 config = Qwen3VLConfig.from_pretrained(model_name)
 
 
 def _load_base_model(model_path):
     """Load weights directly from safetensors, stripping 'model.' prefix,
-    into our custom Qwen3VLModel without loading the full HF model."""
+    into our custom Qwen3VLModel without loading the full HF model.
+
+    `model_path` may be a local directory (a snapshot downloaded by optimize.py)
+    or an HF repo id. Local dirs are used as-is; repo ids are fetched via the hub."""
     from safetensors.torch import load_file
-    from huggingface_hub import hf_hub_download
     import glob
 
-    # Find safetensors file(s) in cache
-    config_path = hf_hub_download(model_path, 'config.json')
-    model_dir = os.path.dirname(config_path)
+    src = model_path or model_name
+    if os.path.isdir(src):
+        model_dir = src
+    else:
+        from huggingface_hub import hf_hub_download
+        config_path = hf_hub_download(src, 'config.json')
+        model_dir = os.path.dirname(config_path)
     st_files = sorted(glob.glob(os.path.join(model_dir, '*.safetensors')))
 
     # Load and strip 'model.' prefix, keeping native bfloat16 precision

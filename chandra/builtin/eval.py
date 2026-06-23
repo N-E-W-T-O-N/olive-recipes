@@ -31,6 +31,12 @@ from PIL import Image
 # would collide with those labels and confuse the model.  Use 1/2/3/4 instead.
 NUMBERS = ["1", "2", "3", "4"]
 
+# Default sweep: every build target. Missing dirs are skipped automatically.
+DEFAULT_TARGETS = [
+    "cpu_int4/models", "cpu_fp16/models", "cpu_fp32/models",
+    "cuda_fp16/models", "cuda_fp32/models",
+]
+
 # System prompt that suppresses chain-of-thought and forces a single-digit response.
 # Pass --system_prompt "" to disable.
 DEFAULT_SYSTEM_PROMPT = (
@@ -281,8 +287,11 @@ def evaluate(dataset, runner_fn, label: str) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="Eval ONNX (quantized) vs PyTorch Qwen3-VL on AI2D")
-    parser.add_argument("--model_path", default="cpu_and_mobile/models",
-                        help="Path to ONNX model dir (default: cpu_and_mobile/models/)")
+    parser.add_argument("--model_path", default=None,
+                        help="evaluate a single ONNX model dir (overrides the default sweep)")
+    parser.add_argument("--targets", default=None,
+                        help="comma-separated model dirs to sweep. Default: all five "
+                             "{cpu,cuda}_{int4,fp16,fp32} targets — missing dirs are skipped.")
     parser.add_argument("--pytorch_model", default=None,
                         help="HuggingFace model ID for PyTorch comparison, e.g. datalab-to/chandra")
     parser.add_argument("--num_samples", type=int, default=100,
@@ -302,15 +311,34 @@ def main():
     else:
         print("\nSystem prompt: (none)")
 
-    # ---- ONNX ----
+    # ---- ONNX: a single --model_path, an explicit --targets list, or (default) the
+    #      full hardcoded sweep. In every case, skip dirs that don't exist on disk. ----
+    if args.model_path:
+        candidates = [args.model_path]
+    elif args.targets:
+        candidates = [t.strip() for t in args.targets.split(",")]
+    else:
+        candidates = DEFAULT_TARGETS
+
+    onnx_paths = []
+    for mp in candidates:
+        if (Path(mp) / "genai_config.json").exists():
+            onnx_paths.append(mp)
+        else:
+            print(f"  [skip] {mp} — not found")
+    if not args.skip_onnx and not onnx_paths:
+        print("  [skip] no ONNX targets found on disk.")
+
     if not args.skip_onnx:
-        onnx_model, onnx_proc, onnx_tok = build_onnx_runner(args.model_path)
+        for mp in onnx_paths:
+            onnx_model, onnx_proc, onnx_tok = build_onnx_runner(mp)
 
-        def onnx_runner(pil_image, question, options):
-            msgs = build_messages(question, options, sys_prompt)
-            return run_onnx(onnx_model, onnx_proc, onnx_tok, pil_image, msgs)
+            def onnx_runner(pil_image, question, options, _m=onnx_model, _p=onnx_proc, _t=onnx_tok):
+                msgs = build_messages(question, options, sys_prompt)
+                return run_onnx(_m, _p, _t, pil_image, msgs)
 
-        results.append(evaluate(ds, onnx_runner, f"ONNX+sysprompt (INT4) @ {args.model_path}"))
+            results.append(evaluate(ds, onnx_runner, f"ONNX @ {mp}"))
+            del onnx_model, onnx_proc, onnx_tok
 
     # ---- PyTorch (optional) ----
     if args.pytorch_model:

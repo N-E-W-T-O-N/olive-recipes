@@ -1,0 +1,11 @@
+keywords:
+  - olive-ai
+  - tts
+  - speech-synthesis
+recipes:
+  - name: Qwen3-TTS-VoiceDesign
+    file: optimize.py
+    eps:
+      - CPUExecutionProvider
+    devices:
+      - cpu

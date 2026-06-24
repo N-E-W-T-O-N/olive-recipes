@@ -1,0 +1,18 @@
+# Downloaded checkpoint + intermediate/build artifacts
+model/
+cache/
+*.onnx
+*.onnx.data
+*.safetensors
+_genai_*/
+__pycache__/
+*.pyc
+
+codes/**/__pycache__/
+_load_test.py
+onnx/
+base/
+codes/
+customvoice/
+voicedesign/
+build_tok.log

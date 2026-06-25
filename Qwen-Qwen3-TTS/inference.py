@@ -367,6 +367,9 @@ class Pipeline:
                                         do_sample, top_k, top_p, temperature, repetition_penalty,
                                         sub_do_sample, sub_top_k, sub_top_p, sub_temperature,
                                         seed, verbose)
+        if self.talker is None:
+            raise RuntimeError("no talker model found: need talker_cache.onnx (preferred) or "
+                               "talker.onnx in the model dir.")
         rng = np.random.default_rng(seed)
         suppress = np.array([i for i in range(vocab - 1024, vocab) if i != codec_eos],
                             dtype=np.int64)

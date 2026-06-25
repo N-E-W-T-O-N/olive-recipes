@@ -2,6 +2,15 @@
 
 _Updated: 2026-06-19_
 
+## ✅ De-duplicated talker — ship talker_cache only (~870 MB/dir saved)
+`talker.onnx` (no-cache) and `talker_cache.onnx` (KV-cache) hold the SAME transformer weights
+→ shipping both duplicated ~870 MB per dir. Fix: default export now builds **only
+`talker_cache`** (it does prefill+decode, faster O(n), and is what inference auto-uses); plain
+`talker` is still buildable via explicit `--components talker`. Dropped the redundant
+`talker.onnx` (+ manifest entry) from all dirs that had both → **freed ~22.5 GB** across the
+8 built variants. inference.py guards for "neither talker present". Verified generation still
+works on talker_cache-only dirs (KV-cache path, audio produced).
+
 ## ✅ Config-driven dims — 0.6B now exports; 1.7B undisturbed
 `user_script.py` had 1.7B dims hardcoded (hidden 2048, 28 layers, etc.) in the talker /
 talker_cache / code_predictor / residual_embed io+dummy funcs → 0.6B (hidden **1024**) would

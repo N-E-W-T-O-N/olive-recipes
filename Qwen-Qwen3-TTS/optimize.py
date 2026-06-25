@@ -214,6 +214,12 @@ def main():
         tts_type = json.loads((model_dir / "config.json").read_text()).get("tts_model_type")
         if "speaker_encoder" in components and tts_type != "base":
             components.remove("speaker_encoder")
+        # talker and talker_cache hold the SAME transformer weights (no-cache vs KV-cache
+        # forward). Shipping both duplicates ~870 MB. Default to talker_cache only (it does
+        # prefill+decode, is faster O(n), and is what inference auto-uses); the plain no-cache
+        # `talker` is still buildable explicitly if a simpler graph is wanted.
+        if "talker" in components and "talker_cache" in components:
+            components.remove("talker")
     out_dir = output_root(args.device, args.precision)
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Model {args.model} [{kind}] | {args.device}/{args.precision} → {out_dir}")

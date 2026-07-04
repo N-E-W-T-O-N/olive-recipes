@@ -1,0 +1,11 @@
+keywords:
+  - olive-ai
+  - tts
+  - speech-synthesis
+recipes:
+  - name: VibeVoice
+    file: optimize.py
+    eps:
+      - CPUExecutionProvider
+    devices:
+      - cpu

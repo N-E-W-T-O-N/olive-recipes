@@ -1,0 +1,9 @@
+# Downloaded checkpoint + intermediate/build artifacts
+model/
+cache/
+onnx/
+cpu_int4/models/*.onnx
+cpu_int4/models/*.onnx.data
+_genai_*/
+__pycache__/
+*.pyc

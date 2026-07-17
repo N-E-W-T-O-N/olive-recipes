@@ -209,25 +209,30 @@ def run_backbone_step(sessions: dict, input_ids: np.ndarray, audio_mask: np.ndar
 
     B, S, _ = embeds.shape
 
-    # 2. llm_decoder
+    # 2. llm_decoder — match the LLM's expected float dtype (the fp16 audio encoder emits float16,
+    # but an int4/fp32 LLM wants float32; a gpu fp16 LLM wants float16). Cast to whatever it declares.
+    _ORT2NP = {"tensor(float)": np.float32, "tensor(float16)": np.float16}
     llm_sess   = sessions["llm_decoder"]
     llm_inputs = llm_sess.get_inputs()
-    attn_mask  = np.ones((B, S), dtype=np.int64)
-    pos_ids    = np.arange(S, dtype=np.int64)[None, :]
-    feed = {
-        "inputs_embeds":  embeds,
-        "attention_mask": attn_mask,
-        "position_ids":   pos_ids,
-    }
+    llm_dtype  = _ORT2NP.get(next(i.type for i in llm_inputs if i.name == "inputs_embeds"), np.float32)
+    # only feed inputs the exported LLM actually declares (genai builds vary: some omit position_ids)
+    names = {i.name for i in llm_inputs}
+    feed = {"inputs_embeds": embeds.astype(llm_dtype, copy=False)}
+    if "attention_mask" in names:
+        feed["attention_mask"] = np.ones((B, S), dtype=np.int64)
+    if "position_ids" in names:
+        feed["position_ids"] = np.arange(S, dtype=np.int64)[None, :]
     for inp in llm_inputs:
         if "past" in inp.name:
-            feed[inp.name] = np.zeros((B, 8, 0, 128), dtype=np.float32)
+            feed[inp.name] = np.zeros((B, 8, 0, 128), dtype=llm_dtype)
 
     hidden_states = llm_sess.run(["hidden_states"], feed)[0]   # (B, S, 1024)
 
-    # 3. audio_heads_decoder
-    logits = sessions["audio_heads"].run(
-        ["logits"], {"hidden_states": hidden_states}
+    # 3. audio_heads_decoder — likewise match its expected input dtype
+    heads_sess  = sessions["audio_heads"]
+    heads_dtype = _ORT2NP.get(next(i.type for i in heads_sess.get_inputs() if i.name == "hidden_states"), np.float32)
+    logits = heads_sess.run(
+        ["logits"], {"hidden_states": hidden_states.astype(heads_dtype, copy=False)}
     )[0]   # (B, 8, S, 1025)
 
     return logits
@@ -310,14 +315,27 @@ def iterative_unmask(
         if len(masked_pos) == 0:
             break
 
-        # Unmask the most-confident position
-        best = masked_pos[confidence[masked_pos].argmax()]
-        for cb in range(num_codebooks):
-            input_ids[0, cb, gen_start + best] = gen_logits[cb, best, :1024].argmax()
-        num_masked -= 1
+        # Unmask the most-confident positions. Fill enough per step (ceil of remaining / remaining
+        # steps) so EVERY frame is decoded by the final step — otherwise leftover MASK ids (1024)
+        # reach the codec decoder and crash it (valid codebook range is 0..1023).
+        remaining_steps = max(1, num_steps - step)
+        n_this = max(1, int(np.ceil(len(masked_pos) / remaining_steps)))
+        order = masked_pos[np.argsort(-confidence[masked_pos])][:n_this]
+        for best in order:
+            for cb in range(num_codebooks):
+                input_ids[0, cb, gen_start + best] = int(gen_logits[cb, best, :1024].argmax())
+        num_masked -= len(order)
 
         if (step + 1) % 8 == 0 or step == 0:
             print(f"  Step {step+1:3d}/{num_steps}: {num_masked:4d} positions remain masked")
+
+    # safety net: any frame still masked after the loop → greedy-fill from the last logits
+    leftover = np.where(input_ids[0, 0, gen_start:] == audio_mask_id)[0]
+    if len(leftover):
+        gl = run_backbone_step(sessions, input_ids, audio_mask)[0, :, gen_start:, :1024]
+        for pos in leftover:
+            for cb in range(num_codebooks):
+                input_ids[0, cb, gen_start + pos] = int(gl[cb, pos].argmax())
 
     return input_ids[0, :, gen_start:]   # (8, T_gen)
 
@@ -360,7 +378,9 @@ def main():
     # --- Tokenise input text ---
     print("\nTokenising text...")
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained("Prince-1/OmniVoice", trust_remote_code=True)
+    # load the (standard Qwen2) tokenizer from the local model dir — avoids the network round-trip
+    # and the custom `omnivoice` package that the remote repo's trust_remote_code path pulls in.
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
     text_tokens = tokenizer.encode(args.text, add_special_tokens=True)
     print(f"  Tokens ({len(text_tokens)}): {text_tokens[:8]}{'...' if len(text_tokens) > 8 else ''}")
 

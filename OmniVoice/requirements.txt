@@ -3,6 +3,7 @@ torch>=2.10.0
 torchaudio>=2.1.0
 transformers>=5.4.0
 onnxruntime>=1.18.0
+omnivoice
 onnxruntime-genai>=0.14.0
 # HiggsAudioV2TokenizerModel is natively in transformers>=5.4.0 — no extra packages needed.
 # https://huggingface.co/docs/transformers/v5.4.0/en/model_doc/higgs_audio_v2_tokenizer

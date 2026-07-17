@@ -416,11 +416,14 @@ def run_rtf_benchmark(model_dir: str, num_samples: int = 10,
     attn_mask  = np.ones((B, S), dtype=np.int64)
     pos_ids    = np.arange(S, dtype=np.int64)[None, :]
 
-    # Build LLM feed template with empty KV cache
-    llm_feed_template = {
-        "attention_mask": attn_mask,
-        "position_ids":   pos_ids,
-    }
+    # Build LLM feed template with empty KV cache — only include inputs the exported LLM declares
+    # (genai builds vary: the CPU int4/fp32 LLM omits position_ids and computes it internally).
+    names = {i.name for i in llm_sess.get_inputs()}
+    llm_feed_template = {}
+    if "attention_mask" in names:
+        llm_feed_template["attention_mask"] = attn_mask
+    if "position_ids" in names:
+        llm_feed_template["position_ids"] = pos_ids
     for inp in llm_sess.get_inputs():
         if "past" in inp.name:
             llm_feed_template[inp.name] = np.zeros((B, 8, 0, 128), dtype=np.float32)

@@ -64,6 +64,7 @@ def _load_omnivoice(model_path: str):
     in eval-only mode before export).
     attn_implementation='eager' avoids FlashAttention which is not ONNX-traceable.
     """
+    import omnivoice  # noqa: F401 — registers model_type "omnivoice" into transformers' auto mappings
     from transformers import AutoModel
     model = AutoModel.from_pretrained(
         model_path,

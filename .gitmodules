@@ -1,4 +1,0 @@
-[submodule "VibeVoice/codes"]
-	path = VibeVoice/codes
-	url = https://github.com/microsoft/VibeVoice
-	branch = main

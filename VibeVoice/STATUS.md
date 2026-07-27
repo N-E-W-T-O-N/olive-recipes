@@ -1,6 +1,100 @@
 # VibeVoice-1.5B — Current Status
 
-_Updated: 2026-07-01_
+> **Handoff:** read [HANDOFF.md](HANDOFF.md) — mental model, per-checkpoint table, the 10 traps, the new-checkpoint checklist, and the 5-minute operator card. Skill: `.claude/skills/vibevoice-onnx/`.
+
+_Updated: 2026-07-17_
+
+## 2026-07-17 — 1.5b rebuilt & re-verified on CPU (after checkpoints re-downloaded)
+
+Checkpoints re-downloaded: **1.5B** (`model/`, 3/3 shards ✅) and **realtime** (`realtime/`, ✅)
+complete; **asr** (3/8) and **asr-hf** (4/8) still downloading; `acoustic/` config-only. This box
+is **CPU-only (no NVIDIA)**, so builds use `--device cpu` (LLM int4 — genai has no fp16-CPU).
+
+Rebuilt all 7 **1.5b** sub-parts → `onnx/1.5b/cpu_int4/` (5.2 GB: llm_decoder int4 + acoustic
+enc/dec + semantic enc + diffusion_head + acoustic/semantic connectors). `eval.py 1.5b` = **9/9
+PASS** (llm: 140 MatMulNBits / 28 GQA / inputs_embeds; encoders/head/connectors cos 1.0;
+acoustic_decoder cos 0.935 but max|Δ| 3.5e-10 = near-silent case; codec round-trip corr +0.996 /
+SNR +19 dB; tts chain smoke OK). Driver smoke: `inference.py … onnx/1.5b/cpu_int4` → 2.13 s WAV.
+
+Rebuilt all 4 **realtime** sub-parts → `onnx/realtime/cpu_int4/` (1.7 GB: llm_decoder int4 [20
+layers, decoder-only] + acoustic_decoder + diffusion_head + acoustic_connector). `eval.py realtime`
+= **5/5 PASS** (llm 100 MatMulNBits / 20 GQA / inputs_embeds; diffusion_head + connector cos 1.0;
+acoustic_decoder cos 0.893 but max|Δ| 3.07e-10 near-silent; tts chain smoke H=896 OK). Driver smoke:
+`inference_realtime.py … onnx/realtime/cpu_int4` → 2.13 s WAV. Scratch `qwen2_*_standalone/` removed.
+
+Built + verified both **7B front-ends** on CPU (`--exclude-llm`; the 7B LLM int4 serialize is still
+RAM-bound → needs a ≥32 GB-free box):
+- **asr-hf** → `onnx/asr-hf/cpu_int4/` (acoustic_encoder + semantic_encoder + multi_modal_projector).
+  `eval.py asr-hf` = **4/4 PASS** (encoders + projector cos 1.0; asr fusion chain fused=(1,7,3584);
+  LLM/codec/tts-chain SKIP as expected without the LLM).
+- **asr** → `onnx/asr/cpu_int4/` (acoustic enc/dec + semantic enc + acoustic/semantic connectors).
+  `eval.py asr` = **6/6 PASS** (encoders/connectors cos 1.0; acoustic_decoder cos 0.935 maxd 3.9e-10
+  near-silent; codec round-trip corr +0.996 / SNR +19 dB).
+
+Added **`acoustic`** registry key — the standalone `vibevoice_acoustic_tokenizer` checkpoint
+(`acoustic/`, 1.3 GB), transformers-native (`AutoModel`, no `codes/`). New loaders
+`get_acoustic_std_{encoder,decoder}_model` (encode→`.latents`, decode→`.sample`); `all_components`
+handles the no-LLM case; `detect_model_type` maps `vibevoice_acoustic_tokenizer`→`acoustic`. Built
+→ `onnx/acoustic/cpu_fp32/`; `eval.py --precision fp32 acoustic` = **3/3 PASS** (encoder cos 0.999,
+decoder cos 0.939 near-silent, codec round-trip corr +0.999 / SNR +22.9 dB).
+
+All checkpoints downloaded: 1.5b, realtime, asr (17 GB), asr-hf (16 GB), standalone `acoustic` (1.3 GB).
+
+`.gitmodules` fixed: `codes` submodule URL corrected `huggingface/vibevoice` → `microsoft/VibeVoice`
+(pin 303b283) — the old URL left `codes/` empty on fresh clones → `ModuleNotFoundError:
+vibevoice.modular.modular_vibevoice_tokenizer` in every codes/-backed loader.
+
+Audio-quality caveat stands for the TTS builds — int4 hidden-state conditioning is lossy; fp16 would
+need a GPU (genai has no fp16-on-CPU). Remaining: the three **7B ASR LLM decoders** (asr, asr-hf +
+lm_heads) — build on a big-RAM machine; front-ends are done and `inference_asr.py` degrades cleanly.
+
+### Later 2026-07-17 — fp16 eval fix, acoustic fp16/int4, git-dependency option
+
+- **eval.py made dtype-aware** (`parity_component` + `whole_pipeline._feed`): feed each ONNX its
+  DECLARED input dtype (fp16 graphs want float16; timesteps stay fp32). Fixes false "failures" on fp16
+  builds. `1.5b/cpu_fp16` now evals **9/9** (it was fine all along — the harness fed fp32). HANDOFF trap 13.
+- **1.5b CPU variants:** `cpu_int4` 9/9, `cpu_fp32` 9/9, `cpu_fp16` 9/9. `gpu_*` can't be built/run here
+  (CPU-only box; `torch +cpu`, no CUDAExecutionProvider). The user-supplied fp16-on-CPU **LLM** is genai's
+  unfused GQA×0 build needing `position_ids` (not driver-compatible) — a GPU fp16 build avoids that.
+- **acoustic:** `fp32` 3/3 ✅; `fp16` rebuilt with `op_block_list=[ConstantOfShape,ConvTranspose,Resize,
+  Range]` → 3/3 ✅ (ConstantOfShape had emitted fp16 into a float32 consumer — HANDOFF trap 11); `int4`
+  removed — it's a no-op on a conv VAE, so `build_model` now **warns + downgrades int4→fp32** for
+  LLM-less keys (HANDOFF trap 12).
+- **`optimize.py` acoustic key** finalized: `HF_REPO["acoustic"]=microsoft/VibeVoice-AcousticTokenizer`,
+  listed in `--help`/`--list`, transformers-native loaders (no `codes/`).
+- **2026-07-22 — VibeVoice source VENDORED, submodule + git-dep removed (uploadable).** The required
+  upstream subset (modular/, processor/, schedule/, scripts/, configs/ — ~591 KB, MIT/`VIBEVOICE_LICENSE`)
+  now ships as `VibeVoice/vibevoice/` and (copied) `onnx/1.5b/vibevoice/`. `_vibevoice_dir()` returns that
+  tree and raises if absent — no pip/git fallback. Removed: `codes/` submodule, `vibevoice-repo/` clone
+  (~263 MB each), `.gitmodules`, the `vibevoice @ git+…` line in all three onnx pyprojects, and the
+  root-pyproject `vibevoice` dep + `vibevoice-repo` workspace. Imports still use the isolated shim
+  (trap 1). Verified: modular/schedule/processor all resolve from the vendored tree with codes/ deleted;
+  the `onnx/1.5b/` package resolves its own copy. HANDOFF trap 14.
+
+## 2026-07-17 — faithful 1.5B TTS voice-cloning inference built (from source)
+
+No upstream 1.5B TTS `generate` exists (not in transformers — only `vibevoice_asr`/`vibevoice_acoustic_tokenizer`; not in the HF repo; `codes/` has only the training `forward`). Reconstructed it on the ONNX sub-parts, replicating from source:
+- **Dynamic acoustic encoder** — fixed `dynamic_axes`→`dynamic_shapes` (trap #2); now emits `samples/3200` frames (was baked 24000 → 7 vs 7.5 drift), aligning with the processor's `speech_tok_compress_ratio=3200`. Also fixes the codec round-trip length drift.
+- **Voice+prompt prefill** (`common.voice_prompt_embeds`) — runs `codes/` `VibeVoiceProcessor` (with trap-#1 shims: qwen2-fast alias + empty namespaces) → `input_ids` + `speech_input_mask` (70) + reference `speech_tensors`; acoustic-encodes the (24 kHz) voice, applies checkpoint `speech_scaling_factor`/`bias` (0.196/−0.049), connects, scatters the voice embeds into the masked positions. Replicates `forward_speech_features` (acoustic-only; TTS has no semantic tensors).
+- **CFG negative** — parallel `<|image_pad|>` (id 151655) LLM context, prefilled + stepped alongside the positive one (from the streaming `generate`; NOT the old zero-hidden). `inference.py --voice` (default `samples/voices/en-Alice_woman.wav`).
+
+Signal-level result (can't audition here): output went unconditioned→voiced→sharper as each piece landed — RMS 0.004→0.029, ZCR 0.110→0.052, centroid 1721→1065 Hz, sub-4 kHz energy 0.89→0.97. Intelligibility not verified (needs listening); remaining is quality/tuning, not missing machinery.
+
+Notes: the voice path needs the **dynamic** acoustic_encoder (re-exported into `cpu_fp32` + `cpu_int4`). Inference now pulls `codes/` (processor + scheduler) — no longer onnxruntime-only, inherent to VibeVoice's prompt format.
+
+### Working + tuned (later 2026-07-17)
+Confirmed by listening — the pipeline produces **intelligible human speech** in the reference voice. Tuning applied:
+- **fp32, not int4** — int4's raw-hidden quantization adds audible "hiss/background" (trap #5); fp32 is clear. (The `*_bgm.wav` sample voices carry real background music; `en-Alice_woman.wav` is clean.)
+- **CFG negative = static `<|image_pad|>`** (prefill once, reuse) — cfg 1.3 preferred over 1.0; keeps voice while staying **single-session** (fp32 ~5 GB, not ~10 GB).
+- **Auto frame-length** (`--max-frames 0`): ~5 frames/word (no EOS classifier is exported → fixed budget, not auto-stop). Prevents truncation of long text.
+- **Sentence chunking**: split on `[.!?]`, generate each chunk short, concat (150 ms gaps) → keeps each generation in the stable short regime.
+
+**Resolved — the generate works** (single-shot; earlier "chunking" was a regression and is removed). Confirmed intelligible on prose AND a Shakespeare sonnet with the reference voice. Final recipe:
+- **Single-shot** generation (whole prompt in one context) — chunking split phrasing and made some inputs noise; reverted.
+- **Learned EOS (the key fix)** — the 1.5B `lm_head` is **tied to `embed_tokens`**, so `logits = hidden @ embedᵀ` needs no lm_head export. VibeVoice reuses vision tokens for speech; generation **stops when lm_head predicts `<|vision_end|>` (speech-end) or `<|endoftext|>` (EOS)**. This removed the "jargon tail" at the source (e.g. sonnet stopped at frame 101 of a 172 budget → 13.5 s not 22.9 s). `--max-frames` is now just a safety cap. **So "no EOS exported" is NOT a limitation** — it's recovered from the tied weights.
+- **fp32, not int4** for clarity (int4 hidden-quant → hiss). **static `<|image_pad|>` CFG negative**, cfg 1.3. Voice-conditioned prefill (processor + acoustic splice + scale/bias).
+
+**Remaining minor** (1.5B model quality, not pipeline): approximate timbre cloning (gender not always captured); occasional pronunciation quirks ("boy"→"bow") and weak digit reading; fp32 CPU ~2–3 s/frame (GPU `gpu_fp16` far faster). The 7B model would improve fidelity.
 
 ## Status matrix (model × component)
 

@@ -10,7 +10,7 @@ same primitives, factored here:
                            the ASR decoder. One prefill(embeds)->hidden + step(embeds)->hidden loop.
   * OnnxOp               — thin wrapper over a single-file ONNX session (encoders/decoder/
                            connector/diffusion_head/projector).
-  * DiffusionSampler     — the DDPM/DPM denoise loop (diffusion_head.onnx + codes/ scheduler + CFG).
+  * DiffusionSampler     — the DDPM/DPM denoise loop (diffusion_head.onnx + vendored vibevoice/ scheduler + CFG).
   * audio load / normalize (-25 dBFS) / save  — 24 kHz mono (VibeVoice standard).
   * load_tokenizer, load_scaling — Qwen2.5 tokenizer + the stored speech scaling/bias factors.
 
@@ -162,11 +162,20 @@ def load_scaling(src):
     return scale, bias
 
 
-# --------------------------------------------------------------------------- codes/ scheduler
+# -------------------------------------------------------------------- vendored vibevoice scheduler
+def _vibevoice_dir():
+    """The vendored vibevoice source tree shipped alongside this code (VibeVoice/vibevoice/)."""
+    local = HERE / "vibevoice"
+    if local.is_dir():
+        return str(local)
+    raise ModuleNotFoundError(f"vendored vibevoice source missing at {local}")
+
+
 def make_scheduler(diffusion_cfg):
-    """Instantiate codes/ DPMSolverMultistepScheduler from a diffusion_head_config dict."""
+    """Instantiate the vibevoice DPMSolverMultistepScheduler from a diffusion_head_config dict."""
+    base = Path(_vibevoice_dir())
     for name, sub in [("vibevoice", ""), ("vibevoice.schedule", "schedule")]:
-        m = types.ModuleType(name); m.__path__ = [str(HERE / "codes" / "vibevoice" / sub)]
+        m = types.ModuleType(name); m.__path__ = [str(base / sub) if sub else str(base)]
         sys.modules.setdefault(name, m)
     import importlib
     dpm = importlib.import_module("vibevoice.schedule.dpm_solver")
@@ -237,11 +246,17 @@ class OnnxLLM:
         outs = [o.name for o in self.sess.get_outputs()]
         # TTS backbone emits 'hidden_states'; an ASR decoder that kept lm_head emits 'logits'.
         self.out_name = "logits" if "logits" in outs else "hidden_states"
+        # Fused GQA builds compute positions internally; the unfused fallback (fp16-on-CPU / fp32-on-CUDA)
+        # declares a 'position_ids' input we must feed. Match the graph's float dtype (fp16 build wants
+        # float16 embeds + KV cache), else ORT rejects the feed.
+        self.wants_pos = "position_ids" in self.in_names
+        emb_t = next(i.type for i in self.sess.get_inputs() if i.name == "inputs_embeds")
+        self.float_dt = np.float16 if "float16" in emb_t else np.float32
         self.hidden = None
         self._reset()
 
     def _reset(self, batch=1):
-        z = np.zeros((batch, self.kv_heads, 0, self.head_dim), dtype=np.float32)
+        z = np.zeros((batch, self.kv_heads, 0, self.head_dim), dtype=self.float_dt)
         self.past = {}
         for i in range(self.n_layers):
             self.past[f"past_key_values.{i}.key"] = z.copy()
@@ -250,11 +265,14 @@ class OnnxLLM:
         self.batch = batch
 
     def _run(self, embeds):
-        embeds = np.asarray(embeds, dtype=np.float32)
+        embeds = np.asarray(embeds, dtype=self.float_dt)
         b, s, _ = embeds.shape
+        prev = self.total
         self.total += s
         feed = {"inputs_embeds": embeds,
                 "attention_mask": np.ones((b, self.total), dtype=np.int64)}
+        if self.wants_pos:  # positions of the newly-appended tokens
+            feed["position_ids"] = np.arange(prev, prev + s, dtype=np.int64)[None, :].repeat(b, 0)
         feed.update(self.past)
         outs = self.sess.run(None, feed)
         names = [o.name for o in self.sess.get_outputs()]
@@ -298,6 +316,72 @@ def embed_tokens(src, token_ids, model_key):
         d = load_file(sf)
         if key in d:
             return d[key].float().numpy()[ids][None].astype(np.float32)
+    raise RuntimeError(f"{key} not found in {src}")
+
+
+def _load_vv_processor(src):
+    """Load the VibeVoiceProcessor from the vendored vibevoice/ source with the trap-#1 shims: alias
+    the pre-5.10 qwen2 fast tokenizer path, inject empty vibevoice namespaces (no package __init__),
+    swallow Auto*.register collisions (see _vibevoice_dir — vendored VibeVoice/vibevoice/)."""
+    import os, types, importlib
+    base = _vibevoice_dir()                          # VibeVoice/vibevoice/ (vendored source)
+    root = os.path.dirname(base)
+    import transformers as _tf
+    qm = types.ModuleType("transformers.models.qwen2.tokenization_qwen2_fast")
+    qm.Qwen2TokenizerFast = _tf.Qwen2TokenizerFast
+    sys.modules.setdefault("transformers.models.qwen2.tokenization_qwen2_fast", qm)
+    for name, sub in [("vibevoice", ""), ("vibevoice.processor", "processor"), ("vibevoice.modular", "modular")]:
+        if name not in sys.modules:
+            m = types.ModuleType(name); m.__path__ = [os.path.join(base, sub) if sub else base]
+            sys.modules[name] = m
+    from transformers import AutoConfig, AutoModel
+    for cls in (AutoConfig, AutoModel):
+        r = cls.register
+        def _safe(*a, __r=r, **k):
+            try: __r(*a, **k)
+            except Exception: pass
+        cls.register = staticmethod(_safe)
+    VP = importlib.import_module("vibevoice.processor.vibevoice_processor").VibeVoiceProcessor
+    return VP.from_pretrained(str(src))
+
+
+def voice_prompt_embeds(src, onnx_dir, text, voice_path, scale, bias, device="cpu", hop=3200):
+    """Build the TTS prefill embeddings the way VibeVoice's forward_speech_features does, but on ONNX:
+      processor(text, voice) -> input_ids + speech_input_mask + reference speech_tensors
+      voice -> acoustic_encoder.onnx -> latents -> (latents+bias)*scale -> acoustic_connector.onnx
+      inputs_embeds = embed_tokens(input_ids); scatter the voice embeds into the masked positions.
+    Returns (inputs_embeds [1,S,H] float32, input_ids [1,S])."""
+    proc = _load_vv_processor(src)
+    if not text.strip().lower().startswith("speaker"):
+        text = "Speaker 1: " + text
+    wav = load_audio(voice_path, SR)                                  # mono @ 24 kHz
+    out = proc(text=[text], voice_samples=[[wav]], return_tensors="pt")
+    input_ids = np.asarray(out["input_ids"])                         # [1,S]
+    mask = np.asarray(out["speech_input_mask"]).astype(bool)         # [1,S]
+    x = embed_tokens(src, input_ids[0], "1.5b").astype(np.float32)   # [1,S,H]
+    n_fr = int(mask.sum())
+    if n_fr:
+        v = np.asarray(out["speech_tensors"], np.float32).ravel()   # reference samples @ 24 kHz
+        pad = n_fr * hop                                            # pad to exactly n_fr frames
+        v = np.pad(v, (0, max(0, pad - len(v))))[:pad][None, None]  # [1,1,n_fr*hop]
+        lat = OnnxOp(onnx_dir / "acoustic_encoder.onnx", device).run(audio=v)  # [1,n_fr,64]
+        audio_feat = (lat.astype(np.float32) + bias) * scale        # checkpoint speech scale/bias
+        conn = OnnxOp(onnx_dir / "acoustic_connector.onnx", device)
+        vemb = conn.run(**{conn.inames[0]: audio_feat})             # [1,n_fr,H]
+        x[0][mask[0]] = vemb[0]
+    return x, input_ids
+
+
+def load_embed_matrix(src, model_key):
+    """Full token-embedding matrix [vocab, H] for `model_key`. The 1.5B lm_head is TIED to these
+    embeddings, so lm_head logits = hidden @ matrix.T — lets us detect the learned speech-end/EOS
+    token without exporting lm_head (it was excluded; head is the diffusion head)."""
+    from safetensors.torch import load_file
+    key = EMBED_KEY.get(model_key)
+    for sf in glob.glob(str(Path(src) / "*.safetensors")):
+        d = load_file(sf)
+        if key in d:
+            return d[key].float().numpy().astype(np.float32)     # [vocab, H]
     raise RuntimeError(f"{key} not found in {src}")
 
 

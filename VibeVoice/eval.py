@@ -79,7 +79,14 @@ def parity_component(model_key, src, comp, onnx_path):
     inputs = getattr(us, dummy_name)()
     with torch.no_grad():
         ref = _np(pyt(*[inputs[n] for n in names]))
-    got = _session(onnx_path).run(None, {n: inputs[n].numpy() for n in names})[0]
+    # feed each ONNX input at the graph's DECLARED dtype (fp16 builds expect float16, not float32);
+    # the PyTorch ref stays fp32 and cosine absorbs the precision gap.
+    sess = _session(onnx_path)
+    _ORT2NP = {"tensor(float)": np.float32, "tensor(float16)": np.float16,
+               "tensor(int64)": np.int64, "tensor(int32)": np.int32, "tensor(bool)": np.bool_}
+    want = {i.name: _ORT2NP.get(i.type) for i in sess.get_inputs()}
+    feed = {n: (inputs[n].numpy().astype(want[n]) if want.get(n) else inputs[n].numpy()) for n in names}
+    got = sess.run(None, feed)[0]
     m = min(ref.size, got.size)
     a, b = got.ravel()[:m].astype(np.float64), ref.ravel()[:m].astype(np.float64)
     cos = _cos(a, b)
@@ -123,6 +130,18 @@ def _synth_audio(samples, sr=24000):
     return wav.astype(np.float32)[None, None, :]
 
 
+_ORT2NP_FEED = {"tensor(float)": np.float32, "tensor(float16)": np.float16,
+                "tensor(int64)": np.int64, "tensor(int32)": np.int32, "tensor(bool)": np.bool_}
+
+
+def _feed(sess, d):
+    """Cast each fed array to the session's DECLARED input dtype (fp16 graphs want float16;
+    float32-pinned inputs like diffusion timesteps stay float32 — matches the graph either way)."""
+    want = {i.name: _ORT2NP_FEED.get(i.type) for i in sess.get_inputs()}
+    return {k: (v.astype(want[k]) if want.get(k) is not None and hasattr(v, "astype") else v)
+            for k, v in d.items()}
+
+
 def whole_pipeline(model_key, models_dir, audio_path):
     """End-to-end ONNX integrity: codec round-trip + full-chain smoke. Returns list of rows."""
     rows = []
@@ -137,12 +156,12 @@ def whole_pipeline(model_key, models_dir, audio_path):
         samples = enc.get_inputs()[0].shape[2]
         samples = 24000 if not isinstance(samples, int) else samples
         wav = _load_audio(audio_path, samples) if audio_path else _synth_audio(samples)
-        lat = enc.run(None, {"audio": wav})[0]
+        lat = enc.run(None, _feed(enc, {"audio": wav}))[0]
         dec_frames = dec.get_inputs()[0].shape[1]
         if isinstance(dec_frames, int) and lat.shape[1] != dec_frames:
             f = min(lat.shape[1], dec_frames)
             lat = lat[:, :f, :] if lat.shape[1] > f else np.pad(lat, ((0, 0), (0, dec_frames - lat.shape[1]), (0, 0)))
-        recon = dec.run(None, {"latents": lat.astype(np.float32)})[0].ravel()
+        recon = dec.run(None, _feed(dec, {"latents": lat.astype(np.float32)}))[0].ravel()
         n = min(len(recon), wav.size)
         x = wav.ravel()[:n]; y = recon[:n]
         corr = float(np.corrcoef(x, y)[0, 1]) if n > 1 else float("nan")
@@ -160,12 +179,12 @@ def whole_pipeline(model_key, models_dir, audio_path):
         rng = np.random.default_rng(0)
         T = 8
         lat = rng.standard_normal((1, T, 64)).astype(np.float32)
-        cond = conn.run(None, {"features": lat})[0]                 # [1,T,H]
+        cond = conn.run(None, _feed(conn, {"features": lat}))[0]                 # [1,T,H]
         H = cond.shape[-1]
         ni = rng.standard_normal((T, 64)).astype(np.float32)
         ts = (rng.random(T) * 1000).astype(np.float32)
-        pred = dh.run(None, {"noisy_images": ni, "timesteps": ts,
-                             "condition": cond.reshape(T, H).astype(np.float32)})[0]
+        pred = dh.run(None, _feed(dh, {"noisy_images": ni, "timesteps": ts,
+                             "condition": cond.reshape(T, H).astype(np.float32)}))[0]
         ok = pred.shape == (T, 64) and np.isfinite(pred).all() and np.isfinite(cond).all()
         rows.append(("tts chain smoke", f"connector→[H={H}]→diffusion_head pred={pred.shape} finite={ok}", ok))
     else:

@@ -13,6 +13,7 @@ Models & components (all parity-verified vs PyTorch, cos ~1.0):
                                        semantic_encoder acoustic_connector semantic_connector
   asr-hf   (VibeVoice-ASR-HF, 7B)     llm acoustic_encoder semantic_encoder multi_modal_projector
   realtime (Realtime-0.5B, streaming) llm acoustic_decoder diffusion_head acoustic_connector
+  acoustic (VibeVoice-AcousticTokenizer)  acoustic_encoder acoustic_decoder  (standalone; no LLM)
 
 Usage (model is the FINAL positional arg — a known key OR a path to a checkpoint dir):
   uv run optimize.py 1.5b                                  # all components, cpu int4
@@ -96,6 +97,15 @@ MODELS = {
             "acoustic_connector": ("get_acoustic_connector_model", "get_acoustic_connector_io_config", "get_acoustic_connector_dummy_inputs", {}),
         },
     },
+    # standalone Acoustic Tokenizer (encoder + decoder VAE) — no LLM. transformers-native loaders.
+    "acoustic": {
+        "dir": "acoustic",
+        "llm": None,
+        "olive": {
+            "acoustic_encoder": ("get_acoustic_std_encoder_model", "get_acoustic_encoder_io_config", "get_acoustic_encoder_dummy_inputs", {}),
+            "acoustic_decoder": ("get_acoustic_std_decoder_model", "get_acoustic_decoder_io_config", "get_acoustic_decoder_dummy_inputs", {}),
+        },
+    },
 }
 
 # HuggingFace repo per key — used to auto-download when the checkpoint dir is absent.
@@ -105,6 +115,7 @@ HF_REPO = {
     "asr": "microsoft/VibeVoice-ASR",
     "asr-hf": "microsoft/VibeVoice-ASR-HF",
     "realtime": "microsoft/VibeVoice-Realtime-0.5B",
+    "acoustic": "microsoft/VibeVoice-AcousticTokenizer",
 }
 
 # device → (olive device string, execution provider, genai device string)
@@ -137,7 +148,8 @@ def _log(*a):
 
 
 def all_components(model: str):
-    return ["llm"] + list(MODELS[model]["olive"].keys())
+    llm = ["llm"] if MODELS[model].get("llm") else []   # some checkpoints (acoustic) have no LLM
+    return llm + list(MODELS[model]["olive"].keys())
 
 
 def detect_model_type(model_src: Path) -> str:
@@ -150,6 +162,8 @@ def detect_model_type(model_src: Path) -> str:
         return "asr-hf"
     if arch == "VibeVoiceForASRTraining":
         return "asr"
+    if mt == "vibevoice_acoustic_tokenizer":
+        return "acoustic"
     if mt == "vibevoice":
         return "1.5b"
     raise SystemExit(f"cannot auto-detect VibeVoice type at {model_src} "
@@ -197,7 +211,11 @@ def build_olive(model: str, component: str, model_src: Path, target: Path, preci
     tmp = (target / f"_{component}_tmp").resolve()
     passes = {"c": {"type": "OnnxConversion", "use_dynamo_exporter": True}}
     if precision == "fp16":
-        passes["f16"] = {"type": "OnnxFloatToFloat16"}
+        # keep shape/resample ops in fp32 — converting them yields invalid graphs (e.g. the acoustic
+        # tokenizer's ConstantOfShape emitted fp16 where a float32 consumer expects it) and they gain
+        # nothing from fp16. Same class of block-list the Higgs encoders needed.
+        passes["f16"] = {"type": "OnnxFloatToFloat16",
+                         "op_block_list": ["ConstantOfShape", "ConvTranspose", "Resize", "Range"]}
     cfg = {
         "input_model": {"type": "PyTorchModel", "model_path": str(model_src),
                         "model_loader": loader, "model_script": str(HERE / "user_script.py"),
@@ -243,6 +261,17 @@ def build_model(model: str, model_src: Path, device: str, precision: str, compon
         comps = [c for c in comps if c != "llm"]
         print(f"[{model}] --exclude-llm: skipping the LLM decoder build")
 
+    # int4 only quantizes the LLM (MatMulNBits). Keys with no LLM (e.g. acoustic — a conv VAE) have
+    # no quantizable MatMul weights, so int4 is a no-op that just re-emits fp32. Warn + downgrade so
+    # the output isn't a misleadingly-named fp32 copy.
+    if precision == "int4" and "llm" not in comps:
+        print(f"[{model}] WARNING: int4 is a no-op here (no LLM / conv-VAE components have no "
+              f"quantizable MatMul weights) — building fp32 instead.")
+        precision = "fp32"
+        if not output_dir:
+            target = HERE / "onnx" / model / f"{device}_fp32"
+            target.mkdir(parents=True, exist_ok=True)
+
     print(f"\n=== {model}  src={model_src}  device={device}  precision={precision} ===")
     print(f"    target={target}  components={comps}")
     for comp in comps:
@@ -277,7 +306,7 @@ def main():
     if args.list or not args.model:
         print("VibeVoice models & components:")
         for m in MODELS:
-            print(f"  {m:9s} (dir '{MODELS[m]['dir']}', repo '{HF_REPO[m]}'): {' '.join(all_components(m))}")
+            print(f"  {m:9s} (dir '{MODELS[m]['dir']}', repo '{HF_REPO.get(m, 'local-only')}'): {' '.join(all_components(m))}")
         print("\nDevices: cpu cuda   Precisions: int4 fp16 fp32")
         print("Positional 'model': a keyword above or 'all'. Output -> onnx/{model}/{device}_{precision}")
         return

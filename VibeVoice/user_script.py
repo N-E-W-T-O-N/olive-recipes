@@ -126,7 +126,7 @@ def extract_qwen2_asrhf(model_path: str, output_dir: str) -> str:
 
 
 # =============================================================================
-# Acoustic tokenizer (VAE codec) — vendored `codes/` matches VibeVoice-1.5B EXACTLY
+# Acoustic tokenizer (VAE codec) — the vendored vibevoice/ source matches VibeVoice-1.5B EXACTLY
 # (552 weights, 0 missing). We import ONLY the tokenizer module in isolation (the
 # package __init__ pulls the streaming/diffusion chain → diffusers + a qwen2-tokenizer
 # import that transformers 5.10.2 renamed), and shim Auto*.register so it coexists with
@@ -135,11 +135,21 @@ def extract_qwen2_asrhf(model_path: str, output_dir: str) -> str:
 # stages/head; ASR-HF: conv_layers) — this loader targets the 1.5B one.
 # =============================================================================
 import sys as _sys
-_CODES = str(Path(__file__).parent / "codes")
+# The required VibeVoice source is VENDORED here at VibeVoice/vibevoice/ (no submodule, no git
+# dependency) — see VIBEVOICE_LICENSE. We still import it in isolation (below) because its package
+# __init__ collides with transformers' native registration.
+_VENDORED = str(Path(__file__).parent / "vibevoice")
+
+
+def _vibevoice_dir():
+    """The vendored vibevoice source tree shipped alongside this code."""
+    if os.path.isdir(_VENDORED):
+        return _VENDORED
+    raise ModuleNotFoundError(f"vendored vibevoice source missing at {_VENDORED}")
 
 
 def _codes_import(submodule):
-    """Isolated import of a single codes/vibevoice/modular/<submodule> module. Shims
+    """Isolated import of a single vibevoice/modular/<submodule> module. Shims
     Auto*.register (coexist with transformers) and injects empty `vibevoice[.modular]`
     parent packages so the package __init__ (diffusers + renamed qwen2-tokenizer) never runs."""
     import types, importlib
@@ -150,10 +160,18 @@ def _codes_import(submodule):
             try: __r(*a, **k)
             except Exception: pass
         cls.register = staticmethod(_safe)
+    # status: make the vendored vibevoice source (and where it resolves from) visible in the log
+    base = _vibevoice_dir()
+    target = os.path.join(base, "modular", submodule + ".py")
+    print(f"[vibevoice] isolated-import vibevoice.modular.{submodule}  <-  {target}  (vendored)")
+    if not os.path.exists(target):
+        raise ModuleNotFoundError(f"{target} missing in the vendored vibevoice source ({base}).")
     for name, sub in [("vibevoice", ""), ("vibevoice.modular", "modular")]:  # empty parent pkgs
-        m = types.ModuleType(name); m.__path__ = [os.path.join(_CODES, "vibevoice", sub)]
+        m = types.ModuleType(name); m.__path__ = [os.path.join(base, sub)]
         _sys.modules[name] = m
-    return importlib.import_module("vibevoice.modular." + submodule)
+    mod = importlib.import_module("vibevoice.modular." + submodule)
+    print(f"[vibevoice] loaded {submodule} OK (vendored)")
+    return mod
 
 
 def _codes_tokenizer():
@@ -163,7 +181,7 @@ def _codes_tokenizer():
 
 
 def _load_acoustic(model_path):
-    """Load VibeVoice-1.5B's acoustic tokenizer (VAE) via vendored codes/, weights loaded."""
+    """Load VibeVoice-1.5B's acoustic tokenizer (VAE) via the vendored vibevoice/ source, weights loaded."""
     import glob
     from safetensors.torch import load_file
     tok, ACfg = _codes_tokenizer()
@@ -198,15 +216,17 @@ def get_acoustic_encoder_model(model_path=None):
 
 
 def get_acoustic_encoder_io_config(model=None):
+    # dynamo IGNORES dynamic_axes (trap #2) — use dynamic_shapes so the audio length is variable,
+    # else it bakes 24000 (which isn't a multiple of the 3200 hop → 7 vs 7.5 frame drift that
+    # breaks alignment with the processor's speech-token count). frames = samples / 3200.
     return {"input_names": ["audio"], "output_names": ["latents"],
-            "input_shapes": [[1, 1, 24000]], "input_types": ["float32"],
-            "dynamic_axes": {"audio": {0: "batch", 2: "samples"},
-                             "latents": {0: "batch", 2: "frames"}}}
+            "input_shapes": [[1, 1, 25600]], "input_types": ["float32"],
+            "dynamic_shapes": {"audio": {0: "batch", 2: "samples"}}}
 
 
 def get_acoustic_encoder_dummy_inputs(model=None):
-    import torch
-    return {"audio": torch.randn(1, 1, 24000, dtype=torch.float32)}
+    import torch     # 25600 = 8 * 3200 hop → 8 frames (3200-aligned trace sample)
+    return {"audio": torch.randn(1, 1, 25600, dtype=torch.float32)}
 
 
 def get_acoustic_decoder_model(model_path=None):
@@ -236,9 +256,44 @@ def get_acoustic_decoder_dummy_inputs(model=None):
     return {"latents": torch.randn(1, 8, 64, dtype=torch.float32)}
 
 
+# --- standalone Acoustic Tokenizer (microsoft/VibeVoice-*-Acoustic-Tokenizer) --------------------
+# model_type `vibevoice_acoustic_tokenizer` → transformers-native (VibeVoiceAcousticTokenizerModel);
+# NOT the composite prefix. encode() returns `.latents`; decode() returns `.sample`/`.audio`.
+def _load_acoustic_standalone(model_path):
+    from transformers import AutoModel
+    return AutoModel.from_pretrained(str(model_path), dtype="float32").eval().float()
+
+
+def get_acoustic_std_encoder_model(model_path=None):
+    import torch.nn as nn
+    codec = _load_acoustic_standalone(model_path)
+    if hasattr(codec, "decoder"):
+        codec.decoder = None          # drop the unused half → smaller graph + less memory
+
+    class Enc(nn.Module):
+        def __init__(s): super().__init__(); s.codec = codec
+        def forward(s, audio):
+            return s.codec.encode(audio, use_cache=False).latents
+    return Enc().eval()
+
+
+def get_acoustic_std_decoder_model(model_path=None):
+    import torch.nn as nn
+    codec = _load_acoustic_standalone(model_path)
+    if hasattr(codec, "encoder"):
+        codec.encoder = None          # drop the unused half → smaller graph + less memory
+
+    class Dec(nn.Module):
+        def __init__(s): super().__init__(); s.codec = codec
+        def forward(s, latents):
+            out = s.codec.decode(latents, use_cache=False)
+            return out.sample if hasattr(out, "sample") else (out.audio if hasattr(out, "audio") else out[0])
+    return Dec().eval()
+
+
 # =============================================================================
 # ASR-HF acoustic encoder — transformers-NATIVE (VibeVoiceAcousticTokenizerEncoderModel),
-# different arch than 1.5B (conv_layers). No codes/ / shim needed. Loads only the
+# different arch than 1.5B (conv_layers). No vibevoice/ shim needed. Loads only the
 # `acoustic_tokenizer_encoder.*` weights (not the 7B LLM) so it fits in memory.
 # =============================================================================
 
@@ -381,12 +436,12 @@ def get_asrhf_projector_dummy_inputs(model=None):
 
 
 # =============================================================================
-# Realtime-0.5B (`vibevoice_streaming`, auto_map null → codes/) — a streaming TTS
+# Realtime-0.5B (`vibevoice_streaming`, auto_map null → vibevoice/) — a streaming TTS
 # checkpoint. Key groups: model.tts_language_model.* (Qwen2.5-0.5B backbone, 20 layers,
 # no lm_head), model.acoustic_tokenizer.* (DECODER-ONLY, 276 — no encoder shipped, since
 # inference only DECODES generated latents → audio), model.language_model.* (4-layer base),
 # model.prediction_head.* (diffusion), model.acoustic_connector.*, tts_eos_classifier.*.
-# The acoustic decoder matches the codes/ class EXACTLY (stages/head naming; decoder 0
+# The acoustic decoder matches the vendored vibevoice/ class EXACTLY (stages/head naming; decoder 0
 # missing / 0 unexpected) — NOT transformers-native (conv_layers/convtr naming).
 # =============================================================================
 RT_TTS_LM_PREFIX = "model.tts_language_model."
@@ -435,8 +490,8 @@ def extract_qwen2_realtime(model_path: str, output_dir: str) -> str:
 
 
 def _load_realtime_acoustic_decoder(model_path):
-    """Realtime acoustic tokenizer (DECODER-ONLY) via codes/. Loads only `decoder.*` weights
-    (encoder absent from the checkpoint), drops the encoder module. codes/ matches exactly."""
+    """Realtime acoustic tokenizer (DECODER-ONLY) via the vendored vibevoice/ source. Loads only `decoder.*` weights
+    (encoder absent from the checkpoint), drops the encoder module. the vendored source matches exactly."""
     import glob
     from safetensors.torch import load_file
     tok, ACfg = _codes_tokenizer()
@@ -478,7 +533,7 @@ def get_realtime_acoustic_decoder_dummy_inputs(model=None):
 
 
 # =============================================================================
-# Diffusion prediction_head + speech connectors (shared 1.5B / Realtime, via codes/).
+# Diffusion prediction_head + speech connectors (shared 1.5B / Realtime, via the vendored vibevoice/ source).
 #   diffusion_head: ONE denoise step (noisy_images[B,64], timesteps[B], condition[B,H]) → pred[B,64].
 #                   The ~20-step DDPM sampling loop stays in the pipeline; ONNX = one step.
 #   connector: SpeechConnector fc1(in→H) → RMSNorm(H) → fc2(H→H). 1.5B: acoustic 64→1536,
@@ -593,16 +648,16 @@ def get_semantic_connector_dummy_inputs(model=None):
 
 
 # =============================================================================
-# VibeVoice-ASR (`vibevoice`, VibeVoiceForASRTraining, codes/) — an audio→text ASR model:
-# same codes/ family as 1.5B TTS but the LLM is Qwen2.5-7B WITH lm_head (generates text) and
+# VibeVoice-ASR (`vibevoice`, VibeVoiceForASRTraining, vendored vibevoice/) — an audio→text ASR model:
+# same vibevoice/ family as 1.5B TTS but the LLM is Qwen2.5-7B WITH lm_head (generates text) and
 # there is NO prediction_head (no audio generation). Front-end = full acoustic tokenizer (552,
 # enc+dec) + semantic tokenizer (276, ENCODE-only) + acoustic/semantic connectors — all load via
-# the existing codes/ loaders (`_load_acoustic`, `_load_connector`, `_load_semantic`).
+# the existing vibevoice/ loaders (`_load_acoustic`, `_load_connector`, `_load_semantic`).
 # Weight layout: model.language_model.* (338) + top-level lm_head.weight (unlike ASR-HF).
 # =============================================================================
 
 def _load_semantic(model_path):
-    """Semantic tokenizer (ENCODE-only, deterministic latent = encode().mean) via codes/."""
+    """Semantic tokenizer (ENCODE-only, deterministic latent = encode().mean) via the vendored vibevoice/ source."""
     import glob
     from safetensors.torch import load_file
     tok = _codes_import("modular_vibevoice_tokenizer")

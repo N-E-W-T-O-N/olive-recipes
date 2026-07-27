@@ -1,7 +1,7 @@
 """VibeVoice ASR inference (audio → text) over the exported ONNX sub-parts.
 
 Handles BOTH ASR checkpoints (choose via the positional model — key or path):
-  asr     (VibeVoice-ASR, codes/ family)  : acoustic_connector + semantic_connector, fused = sum
+  asr     (VibeVoice-ASR, vibevoice/ family)  : acoustic_connector + semantic_connector, fused = sum
   asr-hf  (VibeVoice-ASR-HF, transformers) : multi_modal_projector fuses acoustic+semantic
 
 Pipeline (reference algorithm on ONNX via common):

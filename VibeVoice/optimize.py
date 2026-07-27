@@ -191,12 +191,22 @@ def build_llm(model: str, model_src: Path, target: Path, precision: str, device:
     _log(f"    [llm] extract={extract_name} -> standalone Qwen2 dir")
     qwen2 = extract(str(model_src), str(HERE))
     target.mkdir(parents=True, exist_ok=True)
-    cache = HERE / f".mb_cache_{model}"; cache.mkdir(exist_ok=True)
     genai_device = DEVICES[device][2]
+    # Unique cache dir PER INVOCATION (not a shared `.mb_cache_{model}`). onnxruntime-genai's
+    # save_model() ends with `if not os.listdir(cache): os.rmdir(cache)` — so a shared cache races
+    # when two optimize.py runs build the same model concurrently (e.g. int4 + fp16, or cpu + cuda):
+    # the first run rmdir's it, the second run's os.listdir(cache) then raises FileNotFoundError.
+    # tempfile.mkdtemp is atomic+unique, so concurrent builds never collide; we clean up defensively
+    # afterwards (genai already removes it when left empty).
+    import tempfile, shutil
+    cache = Path(tempfile.mkdtemp(prefix=f".mb_cache_{model}_{device}_{precision}_", dir=str(HERE)))
     print(f"  ModelBuilder: llm_decoder {precision} on {genai_device} "
           f"(exclude_embeds={excl_embeds}, exclude_lm_head={excl_head}) -> {target}/llm_decoder.onnx")
-    create_model("", qwen2, str(target), precision, genai_device, cache_dir=str(cache),
-                 filename="llm_decoder.onnx", exclude_embeds=excl_embeds, exclude_lm_head=excl_head)
+    try:
+        create_model("", qwen2, str(target), precision, genai_device, cache_dir=str(cache),
+                     filename="llm_decoder.onnx", exclude_embeds=excl_embeds, exclude_lm_head=excl_head)
+    finally:
+        shutil.rmtree(cache, ignore_errors=True)
     print("  llm_decoder done.")
 
 

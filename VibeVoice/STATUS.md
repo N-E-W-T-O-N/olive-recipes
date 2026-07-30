@@ -2,7 +2,59 @@
 
 > **Handoff:** read [HANDOFF.md](HANDOFF.md) — mental model, per-checkpoint table, the 10 traps, the new-checkpoint checklist, and the 5-minute operator card. Skill: `.claude/skills/vibevoice-onnx/`.
 
-_Updated: 2026-07-17_
+_Updated: 2026-07-27_
+
+## 2026-07-27 (later) — VibeVoice-ASR eval 7/7 + WORKING inference (all 5 variants assembled)
+
+User rebuilt `llm/` correctly (all 5 arch_ok, head 128/hidden 3584/28L; fp32≈27G, fp16≈14G, int4≈4.2G).
+Formats match the precision×EP menu: **fused** = cpu_int4, cpu_fp32, **cuda_fp16** (GQA=28); **unfused**
+(off-menu) = cpu_fp16, cuda_fp32. Moved all 5 decoders into `onnx/asr/<variant>/`, built fp32 + fp16
+component sets, distributed so every variant is self-contained (6 onnx each).
+
+**eval** `--device cpu --precision int4 asr` → **7/7 PASS** (llm structural MatMulNBits=141/GQA=28;
+acoustic/semantic enc+dec+connectors parity; codec round-trip corr +0.996 / SNR 19 dB).
+
+**inference** `inference_asr.py --audio en-Alice_woman.wav onnx/asr/cpu_int4` → **working transcript**:
+`[{"Start":0,"End":9.27,"Speaker":0,"Content":"So, just to clarify, we've had 19 to 20 year olds…"}]`.
+Two bugs fixed to get there:
+1. **semantic_encoder baked static `[1,1,24000]`** (dynamo ignored `dynamic_axes`, trap #2) → any non-1s
+   clip rejected. Fixed `get_semantic_tokenizer_encoder_io_config` to `dynamic_shapes` + rebuilt/redistributed
+   to all 5 variants. (The asr-hf semantic io at ~line 358 still has the same `dynamic_axes` bug — fix when
+   that model is next built.)
+2. **ASR prompt protocol** — the driver used a bare "please transcribe" prompt → degenerate ", at, at…".
+   VibeVoice-ASR needs the chat-templated JSON protocol (vendored `VibeVoiceASRProcessor`): system prompt
+   "You are a helpful assistant that transcribes audio input into text output in JSON format." + user turn
+   `<sp_start> <sp_pad>×N <sp_end>\nThis is a {dur}s audio, please transcribe it with these keys: Start
+   time, End time, Speaker ID, Content` + generation prompt; inject `acoustic+semantic` fused features at
+   the pad slots. **Reused tokens** (ASR ships no tokenizer): speech_start/end/pad = Qwen grounding tokens
+   `<|object_ref_start|>`=151646 / `<|object_ref_end|>`=151647 / `<|box_start|>`=151648 — all in plain
+   Qwen2.5, no vocab surgery. Also: `apply_chat_template(tokenize=True)` mangles those reused special
+   tokens → render `tokenize=False` then `tok.encode(add_special_tokens=False)` (preserves single IDs).
+
+## 2026-07-27 — VibeVoice-ASR assembled at onnx/asr (cpu variants) + cuda_fp16 diagnosis
+
+Assembled the ASR pipeline from the pre-built `llm/` decoders + freshly built components. See
+[onnx/asr/ASSEMBLY_NOTES.md](onnx/asr/ASSEMBLY_NOTES.md) for the full table/commands.
+- **`onnx/asr/cpu_int4`** — ✅ complete & CPU-valid: int4 fused-GQA LLM (4.2 GB) + 5 fp32 components;
+  all 6 ONNX load in an ORT CPU session. This is the one runnable-on-CPU ASR pipeline.
+- **`onnx/asr/cpu_fp16`** — built 5 **fp16** components (Olive dynamo + fp16 pass, all load on CPU) +
+  moved the fp16 LLM in. ⚠️ The fp16 LLM is the off-menu **fp16-CPU unfused** graph (GQA=0, 14 GB) →
+  GPU asset only, not CPU-runnable.
+- **`onnx/asr/cpu_fp32`** — fp32 components staged (copied from int4's fp32 set); fp32 7B LLM NOT built
+  (needs ~30 GB; impractical on CPU). Command to finish is in ASSEMBLY_NOTES.
+- LLM decoders **moved** (not copied) into their variant dirs to save disk.
+
+**`llm/` review:** `cpu_int4` ✅ valid; `cpu_fp16` = full fp16 but UNFUSED (off-menu); `cpu_fp32` =
+**wrong model** (hidden 896/20L ≈ 0.5B-class — junk); `cuda_fp32` = correct 7B arch but actually
+**int4** (MatMulNBits+GQA), mislabeled.
+
+**cuda_fp16 `create_model` "bug" — diagnosis:** NOT a code bug. `set_io_dtype` maps cuda+fp16 →
+FLOAT16 fused GQA correctly, the combo is officially supported, and it **builds successfully here**
+on the CPU-only genai 0.14.1 for a tiny Qwen2 repro (no GPU needed at build time). The 7B failure is
+**resource-bound** (this box had ~14 GB free disk; a 7B build needs ~15 GB fp32 extraction + ~15 GB
+fp16 output + RAM). Fix = build on a box with ~35 GB free disk / ~16–20 GB RAM via
+`uv run optimize.py --device cuda --precision fp16 asr`. (Not convertible from `cuda_fp32`, which is
+int4.) Refs: onnxruntime-genai builder.py `set_io_dtype`; supported-combos list; issues #881/#1137.
 
 ## 2026-07-17 — 1.5b rebuilt & re-verified on CPU (after checkpoints re-downloaded)
 

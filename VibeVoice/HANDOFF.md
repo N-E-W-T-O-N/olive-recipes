@@ -96,6 +96,22 @@ Rules that fall out of this:
     ships no non-streaming 1.5B `generate` (codes/ @ 303b283 = training forward + streaming only);
     single-shot AR + this EOS is our reconstruction and it works — chunking regressed it, do not reintroduce.
     (Upstream check was against the vendored `vibevoice/modular/modeling_vibevoice.py` @ upstream 303b283.)
+16. **VibeVoice-ASR inference protocol (audio→JSON) — get all three right or it emits ", at, at…".**
+    (a) **Reused tokens** (ASR ships NO tokenizer): speech_start/end/pad map to Qwen grounding tokens
+    `<|object_ref_start|>` / `<|object_ref_end|>` / `<|box_start|>` (vendored `vibevoice_asr` tokenizer,
+    class `_add_vibevoice_special_tokens`) — already in plain Qwen2.5, no vocab surgery. (b) **Chat prompt**:
+    system = "You are a helpful assistant that transcribes audio input into text output in JSON format.",
+    user = `start + pad×N + end + "\n" + "This is a {dur:.2f} seconds audio, please transcribe it with these
+    keys: Start time, End time, Speaker ID, Content"`, then a generation prompt. (c) **Tokenize via**
+    `apply_chat_template(tokenize=False)` then `tok.encode(add_special_tokens=False)` — `tokenize=True`
+    does NOT preserve the reused special-token strings as single IDs (pad slots → 0). Inject the
+    `acoustic_connector + semantic_connector` SUM at the pad positions (modeling line ~335). N frames =
+    `ceil(samples / speech_tok_compress_ratio)`; stop on `<|im_end|>`/`<|endoftext|>`. Implemented in
+    `inference_asr.py`; verified transcript on cpu_int4.
+17. **`get_semantic_tokenizer_encoder_io_config` used `dynamic_axes` (trap #2) → baked `[1,1,24000]`.**
+    Any clip ≠ 1 s was rejected at inference. Fixed to `dynamic_shapes` (samples axis). The **asr-hf**
+    semantic encoder io (`_load_asrhf_semantic_encoder`, ~line 358) still has the same `dynamic_axes`
+    bug — fix when that model is next rebuilt.
 
 ## 4. Architecture of our code (7 files, one direction of dependency)
 

@@ -29,15 +29,15 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 import common as C
 
-SPEECH_TOKENS = ["<|speech_start|>", "<|speech_pad|>", "<|speech_end|>"]
-
-
-def _resolve_speech_ids(tok):
-    ids = {}
-    for t in SPEECH_TOKENS:
-        i = tok.convert_tokens_to_ids(t)
-        ids[t] = i if isinstance(i, int) and i >= 0 else None
-    return ids
+# Speech markers. VibeVoice-ASR ships NO tokenizer and REUSES existing Qwen2.5 grounding tokens
+# (vendored vibevoice_asr tokenizer: object_ref_start/end + box_start) — so no vocab surgery needed.
+# asr-hf uses literal <|speech_*|> additions. Match the vendored VibeVoiceASRProcessor exactly.
+SYSTEM_PROMPT = "You are a helpful assistant that transcribes audio input into text output in JSON format."
+SHOW_KEYS = ["Start time", "End time", "Speaker ID", "Content"]
+SPEECH_MARKERS = {
+    "asr":    {"start": "<|object_ref_start|>", "pad": "<|box_start|>",   "end": "<|object_ref_end|>"},
+    "asr-hf": {"start": "<|speech_start|>",     "pad": "<|speech_pad|>",  "end": "<|speech_end|>"},
+}
 
 
 def encode_audio_features(key, src, onnx_dir, device, wav):
@@ -89,32 +89,45 @@ def main():
         return
 
     tok = C.load_tokenizer(onnx_dir, src)
-    sid = _resolve_speech_ids(tok)
-    # Prompt: system + user(<speech_start> <speech_pad>*n <speech_end> + instruction).
-    pad = sid["<|speech_pad|>"]
-    if pad is None:
-        # tokenizer lacks the speech tokens (repo shipped none) — add them, then use a pad id.
-        tok.add_special_tokens({"additional_special_tokens": SPEECH_TOKENS})
-        sid = _resolve_speech_ids(tok); pad = sid["<|speech_pad|>"]
-    start = sid["<|speech_start|>"] if sid["<|speech_start|>"] is not None else pad
-    end = sid["<|speech_end|>"] if sid["<|speech_end|>"] is not None else pad
-    pre = tok.encode(f"{args.prompt}\n")
-    ids = pre + [start] + [pad] * n + [end]
-    embeds = C.embed_tokens(src, ids, key)                 # [1,S,H]
-    # inject at the n dedicated speech-pad slots (the [pad]*n block), not any incidental pad id
-    pad_pos = list(range(len(pre) + 1, len(pre) + 1 + n))
-    embeds[0, pad_pos, :] = feats[:len(pad_pos)]            # inject speech features
+    mk = SPEECH_MARKERS.get(key, SPEECH_MARKERS["asr"])
+    pad_id = tok.convert_tokens_to_ids(mk["pad"])
+
+    # Reconstruct the VibeVoiceASRProcessor prompt EXACTLY:
+    #   system(apply_chat_template) + user(apply_chat_template of  start + pad*n + end + "\n" + suffix)
+    # with add_generation_prompt so the assistant turn is primed. Speech features are injected at the
+    # pad slots. (A plain "please transcribe" prompt without the chat template → degenerate output.)
+    dur = len(wav) / C.SR
+    suffix = (f"This is a {dur:.2f} seconds audio, please transcribe it with these keys: "
+              + ", ".join(SHOW_KEYS))
+    speech_ph = mk["start"] + mk["pad"] * n + mk["end"]
+    # Render the whole chat to TEXT, then encode ourselves: apply_chat_template(tokenize=True) does
+    # not preserve the reused special-token strings as single IDs, but tok.encode() does (verified).
+    text = tok.apply_chat_template(
+        [{"role": "system", "content": SYSTEM_PROMPT},
+         {"role": "user", "content": speech_ph + "\n" + suffix}],
+        tokenize=False, add_generation_prompt=True)
+    ids = tok.encode(text, add_special_tokens=False)
+
+    pad_pos = [i for i, t in enumerate(ids) if t == pad_id]
+    if len(pad_pos) != n:
+        print(f"  [warn] pad slots {len(pad_pos)} != {n} frames — injecting min()")
+    embeds = C.embed_tokens(src, ids, key, onnx_dir=onnx_dir)               # [1,S,H]
+    m = min(len(pad_pos), n)
+    embeds[0, pad_pos[:m], :] = feats[:m]                   # inject fused (acoustic+semantic) features
+    print(f"  prompt {len(ids)} tokens ({len(pad_pos)} speech slots), decoding…")
 
     llm = C.OnnxLLM(llm_path, device)
     logits = llm.prefill(embeds)                            # [1,S,V]
-    eos = getattr(tok, "eos_token_id", None)
+    eos_ids = {i for i in (getattr(tok, "eos_token_id", None),
+                           tok.convert_tokens_to_ids("<|im_end|>"),
+                           tok.convert_tokens_to_ids("<|endoftext|>")) if isinstance(i, int) and i >= 0}
     out = []
     for _ in range(args.max_new_tokens):
         nxt = int(np.asarray(logits)[0, -1].argmax())
-        if eos is not None and nxt == eos:
+        if nxt in eos_ids:
             break
         out.append(nxt)
-        logits = llm.step(C.embed_tokens(src, [nxt], key))
+        logits = llm.step(C.embed_tokens(src, [nxt], key, onnx_dir=onnx_dir))
     text = tok.decode(out, skip_special_tokens=True)
     print(f"\nTRANSCRIPT:\n{text}")
 

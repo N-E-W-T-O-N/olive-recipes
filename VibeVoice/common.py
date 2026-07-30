@@ -99,14 +99,21 @@ def _providers(device):
     return ["CUDAExecutionProvider", "CPUExecutionProvider"] if device == "cuda" else ["CPUExecutionProvider"]
 
 
+_ORT2NP = {"tensor(float)": np.float32, "tensor(float16)": np.float16, "tensor(double)": np.float64,
+           "tensor(int64)": np.int64, "tensor(int32)": np.int32, "tensor(bool)": np.bool_}
+
+
 class OnnxOp:
     """Single-input/-output-ish ONNX op. run(**named_np) -> first output array."""
     def __init__(self, path, device="cpu"):
         self.sess = _ort().InferenceSession(str(path), providers=_providers(device))
         self.inames = [i.name for i in self.sess.get_inputs()]
+        # feed each input at the graph's DECLARED dtype — fp16 components expect float16, not float32
+        # (blindly casting to float32 → "Unexpected input data type … expected tensor(float16)").
+        self.itypes = {i.name: _ORT2NP.get(i.type, np.float32) for i in self.sess.get_inputs()}
 
     def run(self, **feed):
-        feed = {k: np.asarray(v, dtype=np.float32) if v.dtype != np.int64 else v for k, v in feed.items()}
+        feed = {k: np.asarray(v).astype(self.itypes.get(k, np.float32)) for k, v in feed.items()}
         return self.sess.run(None, {k: feed[k] for k in self.inames})[0]
 
 
@@ -304,19 +311,41 @@ EMBED_KEY = {
 }
 
 
-def embed_tokens(src, token_ids, model_key):
+_EMBED_SESS = {}
+
+
+def _embed_onnx_session(path, device="cpu"):
+    p = str(path)
+    if p not in _EMBED_SESS:
+        _EMBED_SESS[p] = _ort().InferenceSession(p, providers=_providers(device))
+    return _EMBED_SESS[p]
+
+
+def embed_tokens(src, token_ids, model_key, onnx_dir=None, device="cpu"):
     """Look up token embeddings for the exported decoder of `model_key`.
-    Returns [1, len, H] float32. token_ids: 1-D list/array."""
+    Returns [1, len, H] float32. token_ids: 1-D list/array.
+
+    Prefers the shipped `embeddings.onnx` next to the decoder (onnx_dir) so the package is
+    self-contained (the genai decoder is exclude_embeds → needs this step; the embeddings.onnx graph
+    is input_ids→inputs_embeds via Gather). Falls back to the source checkpoint's embed_tokens weight
+    when the companion graph isn't present."""
     from safetensors.torch import load_file
+    ids = np.asarray(token_ids, dtype=np.int64).ravel()
+    if onnx_dir is not None:
+        emb = Path(onnx_dir) / "embeddings.onnx"
+        if emb.exists():
+            sess = _embed_onnx_session(emb, device)
+            name = sess.get_inputs()[0].name
+            out = sess.run(None, {name: ids[None].astype(np.int64)})[0]     # [1, len, H]
+            return np.asarray(out, dtype=np.float32)
     key = EMBED_KEY.get(model_key)
     if key is None:
         raise RuntimeError(f"no embed_tokens key mapping for model '{model_key}'")
-    ids = np.asarray(token_ids, dtype=np.int64).ravel()
     for sf in glob.glob(str(Path(src) / "*.safetensors")):
         d = load_file(sf)
         if key in d:
             return d[key].float().numpy()[ids][None].astype(np.float32)
-    raise RuntimeError(f"{key} not found in {src}")
+    raise RuntimeError(f"{key} not found in {src} and no embeddings.onnx in {onnx_dir}")
 
 
 def _load_vv_processor(src):

@@ -686,15 +686,17 @@ def get_semantic_tokenizer_encoder_model(model_path=None):
 
 
 def get_semantic_tokenizer_encoder_io_config(model=None):
+    # dynamo IGNORES dynamic_axes (trap #2) — use dynamic_shapes so the audio length is variable.
+    # With dynamic_axes the samples dim baked to 24000 (1s) and any other-length clip was rejected
+    # at inference ("Got invalid dimensions for input: audio"). Mirror the acoustic encoder.
     return {"input_names": ["audio"], "output_names": ["latents"],
-            "input_shapes": [[1, 1, 24000]], "input_types": ["float32"],
-            "dynamic_axes": {"audio": {0: "batch", 2: "samples"},
-                             "latents": {0: "batch", 1: "frames"}}}
+            "input_shapes": [[1, 1, 25600]], "input_types": ["float32"],
+            "dynamic_shapes": {"audio": {0: "batch", 2: "samples"}}}
 
 
 def get_semantic_tokenizer_encoder_dummy_inputs(model=None):
     import torch
-    return {"audio": torch.randn(1, 1, 24000, dtype=torch.float32)}
+    return {"audio": torch.randn(1, 1, 25600, dtype=torch.float32)}
 
 
 def extract_qwen2_asr(model_path: str, output_dir: str) -> str:

@@ -181,6 +181,57 @@ def resolve_target(arg: str):
     return detect_model_type(src), src
 
 
+# Input token-embedding weight per model (the [vocab, hidden] lookup table). The genai decoders are
+# built exclude_embeds=True (input = inputs_embeds), so this CONSTANT weight is shipped next to the
+# ONNX to make the package self-contained — the driver turns token ids into vectors from this file
+# (else it must read the multi-GB source checkpoint). Mirrors common.EMBED_KEY.
+EMBED_WEIGHT_KEY = {
+    "1.5b": "model.language_model.embed_tokens.weight",
+    "asr": "model.language_model.embed_tokens.weight",
+    "asr-hf": "language_model.model.embed_tokens.weight",
+    "realtime": "model.tts_language_model.embed_tokens.weight",
+}
+
+
+def extract_embed_matrix(model: str, model_src: Path, target: Path, precision: str):
+    """Export {target}/embeddings.onnx : input_ids[int64, B×S] -> inputs_embeds[float, B×S×H] via a
+    Gather on the input token-embedding table. The genai decoder is built exclude_embeds=True, so this
+    small companion graph provides the missing embed step and makes the package self-contained (no
+    source checkpoint at inference — the genai-native embeddings.onnx pattern). fp16 for fp16 builds,
+    else fp32; weights go to embeddings.onnx.data (external). Constant weight — a one-time snapshot."""
+    import glob
+    import numpy as np
+    import onnx
+    from onnx import helper, numpy_helper, TensorProto
+    from safetensors import safe_open
+    key = EMBED_WEIGHT_KEY.get(model)
+    if key is None:
+        print(f"  [embed] no embed key for '{model}' — skip"); return
+    # Always fp16: a fp32 [vocab,hidden] table is >2 GB and trips the protobuf serialize limit, and the
+    # decoder's OnnxLLM driver upcasts inputs_embeds to the graph dtype anyway (so fp32/int4 decoders
+    # still receive fp32 input). Embedding values sit well within fp16 range — negligible loss.
+    np_dt, tp = np.float16, TensorProto.FLOAT16
+    W = None
+    for sf in glob.glob(str(Path(model_src) / "*.safetensors")):
+        with safe_open(sf, "pt") as f:
+            if key in f.keys():
+                W = f.get_tensor(key).float().numpy().astype(np_dt); break
+    if W is None:
+        print(f"  [embed][warn] {key} not found in {model_src} — package will need the source checkpoint"); return
+    V, H = W.shape
+    g = helper.make_graph(
+        [helper.make_node("Gather", ["embed_weight", "input_ids"], ["inputs_embeds"], axis=0)],
+        "embeddings",
+        inputs=[helper.make_tensor_value_info("input_ids", TensorProto.INT64, ["batch", "seq"])],
+        outputs=[helper.make_tensor_value_info("inputs_embeds", tp, ["batch", "seq", H])],
+        initializer=[numpy_helper.from_array(W, name="embed_weight")])
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)])
+    out = Path(target) / "embeddings.onnx"
+    onnx.save(m, str(out), save_as_external_data=True, location="embeddings.onnx.data",
+              size_threshold=1024, all_tensors_to_one_file=True)
+    print(f"  [embed] embeddings.onnx {tuple(W.shape)} {np_dt.__name__} -> {target}")
+
+
 def build_llm(model: str, model_src: Path, target: Path, precision: str, device: str):
     """Extract a standalone Qwen2 dir, then ModelBuilder → llm_decoder.onnx at --precision."""
     import user_script
@@ -208,6 +259,7 @@ def build_llm(model: str, model_src: Path, target: Path, precision: str, device:
     finally:
         shutil.rmtree(cache, ignore_errors=True)
     print("  llm_decoder done.")
+    extract_embed_matrix(model, model_src, target, precision)   # ship the embedding table alongside
 
 
 def build_olive(model: str, component: str, model_src: Path, target: Path, precision: str, device: str):

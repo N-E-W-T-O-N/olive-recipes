@@ -6,3 +6,4 @@ cpu_int4/models/*.onnx.data
 _genai_*/
 __pycache__/
 *.pyc
+.mb_cache_*/

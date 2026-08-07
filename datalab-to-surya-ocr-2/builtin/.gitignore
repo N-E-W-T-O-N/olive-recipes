@@ -1,4 +1,12 @@
-cpu_and_mobile/models/
-cuda/models/
+# Generated model artifacts
+models/
+
+# Python bytecode
 __pycache__/
 *.pyc
+
+# Olive cache
+.olive-cache/
+
+# Downloaded HF model snapshot
+model/

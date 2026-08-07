@@ -78,6 +78,12 @@ Rules that fall out of this:
     dummies → `Unexpected input data type`. `eval.py` (`parity_component` + `whole_pipeline._feed`) casts
     per graph; float32-pinned inputs (diffusion `timesteps`) stay fp32. Without this, fp16 builds falsely
     "fail" eval though the graphs are fine.
+    **Recurred 2026-08-04 in the *asr fusion chain* block** — added after this trap was written, it
+    called `.run()` directly with raw float32 (and force-cast the projector inputs to float32),
+    bypassing `_feed`. int4/fp32 passed (their audio parts are fp32 anyway); **cpu_fp16 blew up in
+    stage B** with exactly the error above, making a perfectly good build look broken. Now every feed
+    in `whole_pipeline` goes through `_feed`. *If you add a block to `whole_pipeline`, use `_feed` —
+    a bare `.run()` is the bug.*
 14. **The VibeVoice source is VENDORED at `VibeVoice/vibevoice/` (~591 KB, MIT — see `VIBEVOICE_LICENSE`).**
     NOT a submodule, NOT a pip/git dependency. `_vibevoice_dir()` (user_script + common) returns that
     directory and raises if it's missing. The former `codes/` submodule, the `vibevoice-repo/` workspace
@@ -109,9 +115,93 @@ Rules that fall out of this:
     `ceil(samples / speech_tok_compress_ratio)`; stop on `<|im_end|>`/`<|endoftext|>`. Implemented in
     `inference_asr.py`; verified transcript on cpu_int4.
 17. **`get_semantic_tokenizer_encoder_io_config` used `dynamic_axes` (trap #2) → baked `[1,1,24000]`.**
-    Any clip ≠ 1 s was rejected at inference. Fixed to `dynamic_shapes` (samples axis). The **asr-hf**
-    semantic encoder io (`_load_asrhf_semantic_encoder`, ~line 358) still has the same `dynamic_axes`
-    bug — fix when that model is next rebuilt.
+    Any clip ≠ 1 s was rejected at inference. Fixed to `dynamic_shapes` (samples axis).
+    **asr-hf followed (2026-08-04, now FIXED):** this note predicted it, and it duly bit on the first
+    asr-hf rebuild — `inference_asr.py` died with
+    `Got invalid dimensions for input: audio … Got: 222480 Expected: 24000` on a 9.3 s wav.
+    `_enc_io_config()` (shared by BOTH asr-hf encoders, acoustic + semantic) now declares
+    `dynamic_shapes={"audio": {0:"batch", 2:"samples"}}` alongside the legacy `dynamic_axes`.
+    Verified post-rebuild: input shape is `['batch', 1, 'samples']`, not `[1,1,24000]`.
+    *Lesson: a documented trap isn't fixed until every io_config that shares the pattern is checked —
+    grep for `dynamic_axes` without a sibling `dynamic_shapes` whenever adding a dynamo-exported model.*
+18. **asr-hf speech markers were WRONG → fluent, fabricated transcripts (2026-08-04).** The biggest
+    time-sink of the session, and it produced *plausible* output rather than an error.
+    `inference_asr.py` hardcoded `asr-hf` markers as `<|speech_start|>/<|speech_pad|>/<|speech_end|>`.
+    Those tokens **do not exist** in the released VibeVoice-ASR-HF vocab —
+    `convert_tokens_to_ids()` returned `None`, so `pad_pos` was empty, **no audio features were ever
+    injected**, and the 7B dutifully transcribed the literal prompt text:
+    `"This is a speech pad. This is a speech pad. …"` — repeated to the token limit, wrapped in
+    correct-looking JSON. Only a one-line `[warn] pad slots 0 != 69 frames` hinted at it.
+    **Truth is in the checkpoint's `processor_config.json`:** asr-hf reuses the SAME Qwen grounding
+    tokens as `asr` — `audio_bos_token=<|object_ref_start|>` (151646),
+    `audio_token=<|box_start|>` (151648, the feature slot), `audio_eos_token=<|object_ref_end|>`
+    (151647); `config.json` carries the matching `*_token_id`s. `speech_markers()` now READS that
+    file (falling back to the table), verifies every marker against the tokenizer, and **exits** if
+    one is unknown or if 0 pad slots are found — a silent 0-slot run is now impossible.
+    *Lesson: never hardcode special tokens for a checkpoint that ships a processor config; and treat
+    "0 slots" as fatal, since fluent-but-fabricated output is far more expensive than a crash.*
+19. **`optimize.py` accepted an incomplete checkpoint dir and a path it then ignored (2026-08-04).**
+    Two separate bugs, both fixed: (a) `main()` dispatched only on `args.model in MODELS`, so the
+    path-as-positional form documented in the module docstring silently fell through to
+    "unknown model"; (b) `ensure_checkpoint()` gated on `config.json` alone, so a partial HF download
+    (metadata only, zero `*.safetensors`) passed the check and then blew up much later inside
+    `extract_qwen2_asrhf` with a bare `FileNotFoundError` on `model-00001-of-00008.safetensors`.
+    Now: weights are required up front with an actionable message, paths work as documented, and
+    **`--model PATH`** builds from a checkpoint anywhere on disk (keyword still picks WHICH model;
+    a keyword/checkpoint-type mismatch is rejected rather than silently using the wrong loaders).
+20. **The LLM's attention op is chosen by `(execution_provider, io_dtype)` — NOT by you.** genai's
+    `builders/base.py::make_attention_init()` looks the pair up in `is_gqa_supported()` then
+    `is_packed_attn_supported()`; whatever matches decides the op. Measured on Realtime-0.5B, all six
+    targets, and it matches the tables exactly:
+
+    | target | io_dtype | op emitted |
+    |---|---|---|
+    | cpu_int4 | FLOAT (int4-on-cpu → fp32 I/O) | GroupQueryAttention |
+    | cpu_fp32 | FLOAT | GroupQueryAttention |
+    | **cpu_fp16** | FLOAT16 | **MultiHeadAttention** (in *neither* list → fallback) |
+    | cuda_int4 / cuda_fp16 | FLOAT16 | GroupQueryAttention |
+    | **cuda_fp32** | FLOAT | **Attention (packed)** |
+
+    **CONSEQUENCE (corrected after real inference — this is NOT just a perf note):**
+    - `past_present_share_buffer` is set **only** for GQA — the two odd targets lose it.
+    - MHA on a GQA-shaped model (num_attn_heads ≠ num_kv_heads) forces a `repeat_kv` expansion
+      (base.py ~3139). **That graph CANNOT DECODE.** `cpu_fp16` prefills fine then dies on the first
+      single-token step:
+      `FAIL ... Cast node 'InsertedPrecisionFreeCast_/model/layers.1/attn/v_proj/repeat_kv/Reshape_4/output_0'
+      Shape mismatch attempting to re-use buffer. {1,1,896} != {1,19,896}` — a buffer sized for the
+      19-token prefill reused for the 1-token decode. **So `cpu_fp16` is functionally BROKEN for
+      generation, not merely slower.** (I first wrote this up as "correct, purely perf/memory";
+      real inference disproved that. `cpu_int4` and `cpu_fp32`, both GQA, generate fine.)
+    - `cuda_fp32` (packed Attention) is the other non-GQA target and is **unverified** — exercise
+      generation on a GPU before trusting it.
+    - **This is the same table behind the Surya-2 `cuda_fp32` crash.** There it's fatal because the
+      qwen3_5 hybrid's `_make_full_attention` override never passes `root_input` to the packed op;
+      here it's harmless because VibeVoice extracts a **stock `Qwen2ForCausalLM`**, whose base-class
+      path supplies `root_input` properly. Same mechanism, opposite outcome — architecture decides.
+    - Verify with op counts (`onnx.load(..., load_external_data=False)` + a `Counter` over
+      `op_type`) — a `GQA=0` line in eval's llm check is a real signal here, not noise.
+    - **`eval.py` cannot catch this.** Its llm check is structural (op counts) and stage B SKIPs the
+      autoregressive loop, so `llm.step()` is never called: all six realtime targets passed 5/5 while
+      one could not generate a single token. **Run the inference driver before trusting a target.**
+
+21. **A partial `--precision int4` build used to silently write into the `_fp32` directory.**
+    `build_model` had: `if precision == "int4" and "llm" not in comps:` → downgrade to fp32 **and
+    retarget** to `onnx/<key>/<device>_fp32`. The intent was to avoid a mislabelled fp32 copy for
+    conv-VAE-only builds, but the retarget was wrong:
+    - It fires only on **partial** builds that exclude `llm`. Full int4 builds keep `llm` in `comps`,
+      so they never hit it — which is why int4 dirs legitimately contain fp32 audio blocks and
+      nobody noticed.
+    - `--precision int4 --components text_lm` therefore wrote `text_lm.onnx` into `cpu_fp32/`
+      (**overwriting** the fp32 copy) and left `cpu_int4/` with **no `text_lm.onnx` at all**. Both
+      int4 realtime targets shipped incomplete; the user caught it, not the tooling.
+    - The downgrade itself was always a no-op: `build_olive` has no int4 path
+      (`dtype = "fp16" if precision == "fp16" else "fp32"`), so int4 already exported fp32.
+    **Fixed:** the retarget is deleted; components that cannot honour the requested precision are
+    still written into the requested dir, matching `embeddings.onnx` (always fp16 everywhere). Any
+    component that isn't `llm` is fp32/fp16 only — `text_lm` is fp32 even in int4 targets (748 MB).
+    **Lesson (again): a rule that only fires on a code path you rarely exercise is a rule you have
+    never tested.** Audit every target dir for every expected file after a partial build — file
+    presence, not just build exit status.
 
 ## 4. Architecture of our code (7 files, one direction of dependency)
 

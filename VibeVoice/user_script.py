@@ -354,10 +354,18 @@ def _enc_wrapper(enc):
 
 
 def _enc_io_config():
+    # NOTE: the encoders are exported with the DYNAMO exporter (build_olive sets
+    # use_dynamo_exporter=True), and dynamo IGNORES `dynamic_axes` — it only honours
+    # `dynamic_shapes`. With only dynamic_axes set, the dummy's 24000 samples got baked in as a
+    # STATIC dim, so inference on any other clip length failed with:
+    #   "Got invalid dimensions for input: audio ... Got: 222480 Expected: 24000"
+    # (a 9.3 s wav). Declaring dynamic_shapes keeps the sample axis symbolic. dynamic_axes is kept
+    # for the legacy exporter path / other consumers; dynamic_shapes is what actually takes effect.
     return {"input_names": ["audio"], "output_names": ["latents"],
             "input_shapes": [[1, 1, 24000]], "input_types": ["float32"],
             "dynamic_axes": {"audio": {0: "batch", 2: "samples"},
-                             "latents": {0: "batch", 1: "frames"}}}
+                             "latents": {0: "batch", 1: "frames"}},
+            "dynamic_shapes": {"audio": {0: "batch", 2: "samples"}}}
 
 
 def _enc_dummy():
@@ -507,6 +515,172 @@ def _load_realtime_acoustic_decoder(model_path):
     assert not dec_miss and not unexp, f"rt acoustic decoder mismatch: dec_missing={len(dec_miss)} unexpected={len(unexp)}"
     model.encoder = None
     return model.float()
+
+
+# =============================================================================
+# Realtime TEXT LM — the 4-layer `model.language_model` text encoder.
+#
+# WHY THIS EXISTS: Realtime has TWO language models. `model.tts_language_model` (20 layers) is the
+# TTS backbone we build via ModelBuilder; `model.language_model` (4 layers) encodes the TEXT and was
+# originally NOT exported at all — so the driver fed raw text-token embeddings straight into the TTS
+# backbone, which was never trained to consume them, and the model emitted fluent-sounding BABBLE.
+# (4 + 20 = the 24 that decoder_config advertises: the config describes both halves.)
+#
+# Reference chain (modeling_vibevoice_streaming_inference.py::forward_tts_lm):
+#     lm_hidden = language_model(text_embeds)          # this module
+#     inputs_embeds[:, start:, :] = lm_hidden          # splice into the tail
+#     inputs_embeds += tts_input_types(mask)           # 1 = text, 0 = speech
+#     -> tts_language_model
+#
+# NOTE: upstream sets `self.language_model.norm = nn.Identity()` — the final RMSNorm is REMOVED.
+# The checkpoint confirms it (no `model.language_model.norm.weight` key). We therefore export via
+# Olive with the norm stripped, NOT via genai ModelBuilder (which would bake a final RMSNorm in).
+# Text is prefilled in one pass here, so no KV cache is needed on this sub-model.
+# =============================================================================
+
+_RT_TEXT_LM_PREFIX = "model.language_model."
+
+
+def _realtime_text_lm_wrapper(lm):
+    """input_ids [B,T] -> last_hidden_state [B,T,H] through the 4-layer text LM (no final norm).
+
+    Built lazily so `torch` stays a function-local import, matching the rest of this module.
+    """
+    import torch
+
+    class _RealtimeTextLMWrapper(torch.nn.Module):
+        def __init__(self, lm):
+            super().__init__()
+            self.lm = lm
+
+        def forward(self, input_ids):
+            return self.lm(input_ids=input_ids).last_hidden_state
+
+    return _RealtimeTextLMWrapper(lm)
+
+
+def _load_realtime_text_lm(model_path=None):
+    import glob
+    import json as _json
+    import torch
+    from safetensors.torch import load_file
+    from transformers import Qwen2Config
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
+
+    src = Path(model_path or model_name)
+    full = _json.loads((src / "config.json").read_text())
+    dec = dict(full["decoder_config"])
+
+    state = {}
+    for sf in sorted(glob.glob(str(src / "*.safetensors"))):
+        for k, v in load_file(sf).items():
+            if k.startswith(_RT_TEXT_LM_PREFIX):
+                state[k[len(_RT_TEXT_LM_PREFIX):]] = v
+    n_layers = len({int(k.split(".")[1]) for k in state if k.startswith("layers.")})
+    assert n_layers > 0, "no model.language_model.* layers found"
+    assert "embed_tokens.weight" in state, "text LM embed_tokens missing"
+
+    dec["num_hidden_layers"] = n_layers          # 4 — NOT decoder_config's 24
+    dec["architectures"] = ["Qwen2Model"]
+    dec.pop("_attn_implementation", None)
+    cfg = Qwen2Config(**{k: v for k, v in dec.items() if k != "architectures"})
+    cfg._attn_implementation = "eager"           # SDPA/flash aren't ONNX-traceable
+
+    lm = Qwen2Model(cfg)
+    lm.norm = torch.nn.Identity()                # upstream does exactly this
+    res = lm.load_state_dict(state, strict=False)
+    missing = [k for k in res.missing_keys if not k.startswith("norm.")]
+    assert not missing, f"text LM missing keys: {missing[:6]}"
+    assert not res.unexpected_keys, f"text LM unexpected keys: {res.unexpected_keys[:6]}"
+    print(f"  [realtime text_lm] {n_layers} layers, hidden={cfg.hidden_size}, norm=Identity, "
+          f"{len(state)} tensors, 0 missing / 0 unexpected")
+    lm.eval()
+    return lm
+
+
+def get_realtime_text_lm_model(model_path=None):
+    return _realtime_text_lm_wrapper(_load_realtime_text_lm(model_path)).eval().float()
+
+
+def get_realtime_text_lm_io_config(model=None):
+    return {"input_names": ["input_ids"], "output_names": ["lm_hidden"],
+            "input_shapes": [[1, 16]], "input_types": ["int64"],
+            "dynamic_shapes": {"input_ids": {0: "batch", 1: "seq"}}}
+
+
+def get_realtime_text_lm_dummy_inputs(model=None):
+    import torch
+    return {"input_ids": torch.randint(0, 1000, (1, 16), dtype=torch.int64)}
+
+
+def export_realtime_extras(model_path, out_dir):
+    """Dump the two tiny non-ONNX tensors sets the realtime driver needs, as .npy/.npz.
+
+    1. type_embed.npy  <- `model.tts_input_types.weight` [2, H]
+       A 2-row lookup (row 1 = text, row 0 = speech) added to the TTS LM's inputs_embeds
+       every step.
+
+    2. eos_head.npz    <- `tts_eos_classifier.{fc1,fc2}.{weight,bias}`
+       The learned stop signal. Upstream (modeling_vibevoice_streaming_inference.py:848)
+       runs it on the TTS LM's last hidden state each frame and finishes the sample when
+       sigmoid(logit) > 0.5:
+           tts_eos_logits = sigmoid(tts_eos_classifier(last_hidden_state[:, -1, :]))
+           if tts_eos_logits[0].item() > 0.5: finished
+       Without it, generation can only stop at --max-frames, so every frame past the end
+       of the text is drift. It is fc2(relu(fc1(x))) on a [H] vector -- ~800K MACs, far
+       too small to be worth its own ONNX graph, so the driver does it in numpy.
+
+    Both are precision-independent (always saved fp32); the driver casts as needed.
+    """
+    import glob
+    import numpy as np
+    from safetensors import safe_open
+
+    want = {
+        "model.tts_input_types.weight": "type",
+        "tts_eos_classifier.fc1.weight": "fc1_w",
+        "tts_eos_classifier.fc1.bias": "fc1_b",
+        "tts_eos_classifier.fc2.weight": "fc2_w",
+        "tts_eos_classifier.fc2.bias": "fc2_b",
+    }
+    got = {}
+    for sf in glob.glob(str(Path(model_path) / "*.safetensors")):
+        with safe_open(sf, "pt") as f:
+            keys = set(f.keys())
+            for k, alias in want.items():
+                if k in keys:
+                    got[alias] = f.get_tensor(k).float().numpy()
+
+    out = Path(out_dir)
+    written = []
+
+    if "type" in got:
+        p = out / "type_embed.npy"
+        np.save(p, got["type"])
+        print(f"  [extras] tts_input_types {got['type'].shape} -> {p.name}")
+        written.append(str(p))
+    else:
+        print("  [extras][warn] model.tts_input_types.weight not found")
+
+    eos = {k: got[k] for k in ("fc1_w", "fc1_b", "fc2_w", "fc2_b") if k in got}
+    if len(eos) == 4:
+        p = out / "eos_head.npz"
+        np.savez(p, **eos)
+        print(
+            f"  [extras] tts_eos_classifier fc1{eos['fc1_w'].shape} fc2{eos['fc2_w'].shape}"
+            f" -> {p.name}"
+        )
+        written.append(str(p))
+    else:
+        missing = [k for k in ("fc1_w", "fc1_b", "fc2_w", "fc2_b") if k not in eos]
+        print(f"  [extras][warn] tts_eos_classifier incomplete, missing {missing};"
+              " generation will have no learned stop and must rely on --max-frames")
+
+    return written
+
+
+# Back-compat alias: earlier builds called this when only type_embed was exported.
+export_realtime_type_embed = export_realtime_extras
 
 
 def get_realtime_acoustic_decoder_model(model_path=None):

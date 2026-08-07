@@ -299,6 +299,36 @@ class OnnxLLM:
         """inputs_embeds [B,s,H] appended to the running KV cache -> hidden [B,s,H]."""
         return self._run(inputs_embeds)
 
+    def seed_prompt(self, keys, values):
+        """Seed the KV cache with a pre-computed VOICE-PROMPT prefix, then continue with step().
+
+        keys/values: lists of `n_layers` arrays shaped [B, kv_heads, P, head_dim].
+
+        This is how speaker identity gets in. VibeVoice-Realtime carries the voice prompt purely as
+        a KV prefix (upstream's `cached_prompt`) — the prompt's own token ids are all `pad_id`, so
+        there is nothing else to feed. Without it the model runs unconditioned and pitch wanders.
+
+        Call INSTEAD of prefill(), never before it: prefill() calls _reset() and would wipe this.
+        Positions continue from P because both attention_mask and position_ids derive from
+        self.total, so the appended text lands at the correct rotary offset.
+        """
+        if len(keys) != self.n_layers:
+            raise ValueError(f"voice prompt has {len(keys)} layers, model wants {self.n_layers} "
+                             f"— wrong cache for this decoder (text LM vs TTS backbone?)")
+        self.past = {}
+        for i, (k, v) in enumerate(zip(keys, values)):
+            k = np.ascontiguousarray(k, dtype=self.float_dt)
+            v = np.ascontiguousarray(v, dtype=self.float_dt)
+            if k.shape[1] != self.kv_heads or k.shape[3] != self.head_dim:
+                raise ValueError(f"layer {i} KV {k.shape} != [B,{self.kv_heads},P,{self.head_dim}]")
+            if k.shape != v.shape:
+                raise ValueError(f"layer {i} key {k.shape} != value {v.shape}")
+            self.past[f"past_key_values.{i}.key"] = k
+            self.past[f"past_key_values.{i}.value"] = v
+        self.batch = keys[0].shape[0]
+        self.total = keys[0].shape[2]
+        return self.total
+
 
 # The exact embed_tokens key per model — the ONNX decoder excludes embeddings, so inference looks
 # them up here. Realtime ships BOTH a base language_model AND a tts_language_model embed table (they

@@ -29,15 +29,52 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 import common as C
 
-# Speech markers. VibeVoice-ASR ships NO tokenizer and REUSES existing Qwen2.5 grounding tokens
-# (vendored vibevoice_asr tokenizer: object_ref_start/end + box_start) — so no vocab surgery needed.
-# asr-hf uses literal <|speech_*|> additions. Match the vendored VibeVoiceASRProcessor exactly.
+# Speech markers. Both ASR checkpoints REUSE existing Qwen2.5 grounding tokens (object_ref_start/end
+# + box_start) rather than adding literal <|speech_*|> tokens — the audio features are injected at the
+# `pad` positions.
+#
+# These are the FALLBACK defaults only. The authoritative source is the checkpoint's
+# processor_config.json (audio_bos_token / audio_token / audio_eos_token), which
+# `speech_markers()` reads — see the note there. Hardcoding `<|speech_*|>` for asr-hf was a real bug:
+# those tokens do not exist in the released VibeVoice-ASR-HF vocab, so convert_tokens_to_ids()
+# returned None, ZERO pad slots were found, no audio features were ever injected, and the model
+# transcribed the literal prompt text ("This is a speech pad. This is a speech pad. …").
 SYSTEM_PROMPT = "You are a helpful assistant that transcribes audio input into text output in JSON format."
 SHOW_KEYS = ["Start time", "End time", "Speaker ID", "Content"]
 SPEECH_MARKERS = {
-    "asr":    {"start": "<|object_ref_start|>", "pad": "<|box_start|>",   "end": "<|object_ref_end|>"},
-    "asr-hf": {"start": "<|speech_start|>",     "pad": "<|speech_pad|>",  "end": "<|speech_end|>"},
+    "asr":    {"start": "<|object_ref_start|>", "pad": "<|box_start|>", "end": "<|object_ref_end|>"},
+    "asr-hf": {"start": "<|object_ref_start|>", "pad": "<|box_start|>", "end": "<|object_ref_end|>"},
 }
+
+
+def speech_markers(key, src, tok):
+    """Resolve the (start, pad, end) speech markers for this checkpoint.
+
+    Prefers the checkpoint's own processor_config.json — VibeVoiceAsrProcessor stores them as
+    audio_bos_token / audio_token / audio_eos_token, and config.json carries the matching
+    *_token_id values. Falls back to SPEECH_MARKERS[key] when the file is absent (e.g. the
+    `asr` family, whose processor lives in the vendored source).
+
+    Every resolved marker is verified against the tokenizer; an unknown token is fatal, because
+    silently getting 0 pad slots produces confident-looking garbage rather than an error.
+    """
+    mk = dict(SPEECH_MARKERS.get(key, SPEECH_MARKERS["asr"]))
+    pc = Path(src) / "processor_config.json"
+    if pc.exists():
+        d = json.loads(pc.read_text(encoding="utf-8"))
+        got = {"start": d.get("audio_bos_token"), "pad": d.get("audio_token"),
+               "end": d.get("audio_eos_token")}
+        if all(got.values()):
+            if got != mk:
+                print(f"  [markers] from processor_config.json: {got}  (default was {mk})")
+            mk = got
+    bad = {k: v for k, v in mk.items() if tok.convert_tokens_to_ids(v) in (None, tok.unk_token_id)}
+    if bad:
+        sys.exit(f"[error] speech marker(s) {bad} are not in the tokenizer of this build.\n"
+                 f"  Without a resolvable pad token no audio features can be injected and the "
+                 f"transcript would be garbage.\n"
+                 f"  Check {pc} against the tokenizer shipped in the built ONNX dir.")
+    return mk
 
 
 def encode_audio_features(key, src, onnx_dir, device, wav):
@@ -89,7 +126,7 @@ def main():
         return
 
     tok = C.load_tokenizer(onnx_dir, src)
-    mk = SPEECH_MARKERS.get(key, SPEECH_MARKERS["asr"])
+    mk = speech_markers(key, src, tok)
     pad_id = tok.convert_tokens_to_ids(mk["pad"])
 
     # Reconstruct the VibeVoiceASRProcessor prompt EXACTLY:
@@ -109,6 +146,14 @@ def main():
     ids = tok.encode(text, add_special_tokens=False)
 
     pad_pos = [i for i, t in enumerate(ids) if t == pad_id]
+    if not pad_pos:
+        # Hard-fail: with no slots the audio is never seen by the LLM and it just re-reads the
+        # prompt text, yielding a fluent but entirely fabricated transcript. That looks like a
+        # model-quality problem and wastes a lot of time — make it an error, not a warning.
+        sys.exit(f"[error] 0 speech slots found for pad token {mk['pad']!r} (id={pad_id}) in a "
+                 f"{len(ids)}-token prompt — audio features cannot be injected.\n"
+                 f"  The chat template likely dropped/re-split the marker. Compare the markers in "
+                 f"{Path(src) / 'processor_config.json'} with the built tokenizer.")
     if len(pad_pos) != n:
         print(f"  [warn] pad slots {len(pad_pos)} != {n} frames — injecting min()")
     embeds = C.embed_tokens(src, ids, key, onnx_dir=onnx_dir)               # [1,S,H]

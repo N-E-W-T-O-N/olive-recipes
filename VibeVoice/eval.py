@@ -194,10 +194,16 @@ def whole_pipeline(model_key, models_dir, audio_path):
     if "multi_modal_projector" in present and "acoustic_encoder" in present and "semantic_encoder" in present:
         ae, se, proj = (_session(present[k]) for k in ("acoustic_encoder", "semantic_encoder", "multi_modal_projector"))
         wav = _synth_audio(24000)
-        al = ae.run(None, {"audio": wav})[0]; sl = se.run(None, {"audio": wav})[0]
+        # Route EVERY feed through _feed() so each graph gets its DECLARED dtype (trap #13).
+        # This block used to call .run() directly with raw float32 (and force .astype(float32) on
+        # the projector inputs), which is fine for fp32/int4 builds but fails on fp16 ones with
+        # "Unexpected input data type. Actual: (tensor(float)), expected: (tensor(float16))" —
+        # i.e. the fp16 build looked broken when only the harness was.
+        al = ae.run(None, _feed(ae, {"audio": wav}))[0]
+        sl = se.run(None, _feed(se, {"audio": wav}))[0]
         f = min(al.shape[1], sl.shape[1])
-        fused = proj.run(None, {"acoustic_latents": al[:, :f].astype(np.float32),
-                                "semantic_latents": sl[:, :f].astype(np.float32)})[0]
+        fused = proj.run(None, _feed(proj, {"acoustic_latents": al[:, :f],
+                                            "semantic_latents": sl[:, :f]}))[0]
         ok = np.isfinite(fused).all()
         rows.append(("asr fusion chain", f"ac+sem→projector fused={fused.shape} finite={ok}", ok))
 

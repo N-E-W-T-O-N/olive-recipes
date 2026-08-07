@@ -18,18 +18,32 @@ Models & components (all parity-verified vs PyTorch, cos ~1.0):
 Usage (model is the FINAL positional arg — a known key OR a path to a checkpoint dir):
   uv run optimize.py 1.5b                                  # all components, cpu int4
   uv run optimize.py --device cuda --precision fp16 asr-hf
-  uv run optimize.py --components llm acoustic_decoder realtime
+  uv run optimize.py --components llm,acoustic_decoder realtime
   uv run optimize.py --device cuda --precision fp16 all
+  uv run optimize.py --model D:/models/asr-hf asr-hf       # build from a checkpoint elsewhere
+  uv run optimize.py --model D:/models/asr-hf              # same, type auto-detected
   uv run optimize.py ./asr-hf                              # a path → type auto-detected from config.json
   uv run optimize.py --list
 
+Checkpoint resolution:
+  keyword only          -> ./<dir> if present, else DOWNLOADED from HF_REPO[key] into ./<dir>
+  keyword + --model P   -> build from P (no download); P's type must match the keyword
+  --model P (no keyword)-> build from P, type auto-detected from P/config.json
+  path as positional    -> same as --model P
+A dir holding only config.json (no *.safetensors/*.bin) is rejected up front as incomplete
+rather than failing later inside weight extraction.
+
 Args:
-  model                                     FINAL positional: {1.5b,asr,asr-hf,realtime,all}
+  model                                     FINAL positional: {1.5b,asr,asr-hf,realtime,acoustic,all}
                                             or a filesystem path to a checkpoint dir (auto-detected)
+  --model PATH                              build FROM this local transformers checkpoint dir
+                                            (overrides the default ./<dir>; nothing is downloaded)
   --device {cpu,cuda}                       target device (default cpu)
   --precision {int4,fp16,fp32}              LLM quantization / audio dtype (default int4)
-  --components ...                          subset (default: all for the model)
-  --output-dir PATH                         override output root (default <model-dir>/<device>_<precision>/models)
+  --components a,b,c                        comma-separated subset (default: all for the model)
+  --exclude-llm                             skip the LLM decoder build
+  --repo ORG/NAME                           override the HF repo id to download from
+  --output-dir PATH                         override output root (default onnx/{model}/{device}_{precision})
 
 Precision note: --precision sets the LLM build (int4 / fp16 / fp32). Audio/diffusion/connector
 blocks are VAE/DiT — int4 doesn't apply, so they export fp32 unless --precision fp16 (then fp16).
@@ -90,8 +104,13 @@ MODELS = {
     },
     "realtime": {
         "dir": "realtime",
+        # NOTE: "llm" here is the 20-layer `tts_language_model` (the TTS backbone). The 4-layer
+        # `language_model` TEXT encoder is a SEPARATE component ("text_lm" below) — without it the
+        # driver feeds raw text embeds into the TTS backbone and the output is babble. See the
+        # header comment on get_realtime_text_lm_model in user_script.py.
         "llm": ("extract_qwen2_realtime", True, True),
         "olive": {
+            "text_lm": ("get_realtime_text_lm_model", "get_realtime_text_lm_io_config", "get_realtime_text_lm_dummy_inputs", {}),
             "acoustic_decoder": ("get_realtime_acoustic_decoder_model", "get_realtime_acoustic_decoder_io_config", "get_realtime_acoustic_decoder_dummy_inputs", {}),
             "diffusion_head": ("get_diffusion_head_model", "get_diffusion_head_io_config", "get_diffusion_head_dummy_inputs", {"VV_HEAD_HIDDEN": "896"}),
             "acoustic_connector": ("get_acoustic_connector_model", "get_acoustic_connector_io_config", "get_acoustic_connector_dummy_inputs", {}),
@@ -128,6 +147,17 @@ def ensure_checkpoint(key, repo_override=None):
     """Return the local checkpoint dir for `key`, downloading from HF if it isn't present."""
     src = (HERE / MODELS[key]["dir"]).resolve()
     if (src / "config.json").exists():
+        # config.json alone is NOT enough: a partial/stub dir (config only, no weight shards)
+        # used to pass this check and then blow up much later inside weight extraction with a
+        # confusing FileNotFoundError on model-0000N-of-....safetensors. Require real weights.
+        if not (list(src.glob("*.safetensors")) or list(src.glob("*.bin"))):
+            sys.exit(
+                f"[{key}] {src} has config.json but NO weight files (*.safetensors / *.bin) — "
+                f"it's an incomplete checkpoint dir.\n"
+                f"  Either delete it and re-run (to download {repo_override or HF_REPO.get(key)}), "
+                f"or pass the path to a complete checkpoint instead, e.g.:\n"
+                f"    uv run optimize.py --device cpu --precision fp16 /path/to/{key}"
+            )
         return src
     repo = repo_override or HF_REPO.get(key)
     if not repo:
@@ -323,16 +353,22 @@ def build_model(model: str, model_src: Path, device: str, precision: str, compon
         comps = [c for c in comps if c != "llm"]
         print(f"[{model}] --exclude-llm: skipping the LLM decoder build")
 
-    # int4 only quantizes the LLM (MatMulNBits). Keys with no LLM (e.g. acoustic — a conv VAE) have
-    # no quantizable MatMul weights, so int4 is a no-op that just re-emits fp32. Warn + downgrade so
-    # the output isn't a misleadingly-named fp32 copy.
+    # int4 (MatMulNBits) applies ONLY to the genai-built `llm` decoder. Every other component goes
+    # through the Olive path, which emits fp32/fp16 only — conv-VAE blocks have no quantizable
+    # MatMuls, and small transformer components like realtime's `text_lm` have no int4 path here
+    # either. build_olive already treats int4 as fp32, so there is nothing to downgrade.
+    #
+    # Do NOT retarget to {device}_fp32. These components must still land in {device}_int4, because
+    # that is the directory the driver loads. This mirrors embeddings.onnx, which is always written
+    # fp16 no matter what the target dir is named, and it is why a full int4 build legitimately
+    # contains fp32 audio/diffusion blocks (see README: int4 is larger than fp16 overall).
+    #
+    # This used to redirect the output dir, which only ever fired on PARTIAL builds that exclude the
+    # llm — silently diverting e.g. `--precision int4 --components text_lm` into the fp32 dir (and
+    # overwriting the fp32 copy) while leaving the int4 dir missing the file entirely.
     if precision == "int4" and "llm" not in comps:
-        print(f"[{model}] WARNING: int4 is a no-op here (no LLM / conv-VAE components have no "
-              f"quantizable MatMul weights) — building fp32 instead.")
-        precision = "fp32"
-        if not output_dir:
-            target = HERE / "onnx" / model / f"{device}_fp32"
-            target.mkdir(parents=True, exist_ok=True)
+        print(f"[{model}] note: int4 quantizes the `llm` decoder only; {comps} export as fp32 "
+              f"into {target.name} — this is expected, not a mislabelled build.")
 
     print(f"\n=== {model}  src={model_src}  device={device}  precision={precision} ===")
     print(f"    target={target}  components={comps}")
@@ -341,6 +377,15 @@ def build_model(model: str, model_src: Path, device: str, precision: str, compon
             build_llm(model, model_src, target, precision, device)
         else:
             build_olive(model, comp, model_src, target, precision, device)
+    if model == "realtime" and not {"text_lm", "tts_lm"}.isdisjoint(comps):
+        # Ship two tiny weight sets the driver needs but that don't justify their own ONNX graphs:
+        #   type_embed.npy — the [2, H] tts_input_types lookup, to tag each TTS-LM step as
+        #                    text(1)/speech(0).
+        #   eos_head.npz   — the tts_eos_classifier, the model's learned stop signal. Without it
+        #                    generation runs to --max-frames and everything past the end of the
+        #                    text is drift.
+        import user_script as _us
+        _us.export_realtime_extras(model_src, target)
     print(f"[{model}] done -> {target}")
 
 
@@ -354,12 +399,18 @@ def main():
     ap.add_argument("--exclude-llm", action="store_true",
                     help="skip the LLM decoder build (e.g. the RAM-bound 7B ASR decoders)")
     ap.add_argument("--repo", help="override the HF repo id to download the checkpoint from")
+    ap.add_argument("--model", dest="model_path", metavar="PATH",
+                    help="path to an already-downloaded transformers checkpoint dir to build FROM "
+                         "(overrides the default ./<dir> location; nothing is downloaded). "
+                         "e.g. --model D:/models/asr-hf")
     ap.add_argument("--output-dir", help="override output dir (default onnx/{model}/{device}_{precision})")
     ap.add_argument("--verbose", "-v", action="store_true", help="verbose logs (Olive + extra detail)")
     ap.add_argument("--list", action="store_true", help="list models + components and exit")
     ap.add_argument("model", nargs="?",
-                    help="FINAL positional: a keyword {1.5b,asr,asr-hf,realtime,all}. "
-                         "The checkpoint is used from ./<dir> if present, else downloaded from HF.")
+                    help="FINAL positional: a keyword {1.5b,asr,asr-hf,realtime,acoustic,all} — picks "
+                         "which model to build. Its checkpoint is used from ./<dir> if present, else "
+                         "downloaded from HF. Use --model PATH to build from a checkpoint elsewhere. "
+                         "A path may also be passed directly here (type auto-detected from config.json).")
     args = ap.parse_args()
     global VERBOSE
     VERBOSE = args.verbose
@@ -373,6 +424,32 @@ def main():
         print("Positional 'model': a keyword above or 'all'. Output -> onnx/{model}/{device}_{precision}")
         return
 
+    # --model PATH: build from an already-downloaded checkpoint anywhere on disk. The positional
+    # keyword still selects WHICH model (so the right extractor/loaders are used); if it's omitted
+    # the type is auto-detected from the checkpoint's config.json.
+    if args.model_path:
+        src = Path(args.model_path).expanduser().resolve()
+        if not (src / "config.json").exists():
+            ap.error(f"--model {src} has no config.json — not a transformers checkpoint dir")
+        if not (list(src.glob("*.safetensors")) or list(src.glob("*.bin"))):
+            ap.error(f"--model {src} has config.json but NO weight files (*.safetensors / *.bin) "
+                     f"— it's an incomplete/partial checkpoint")
+        if args.model in (None, "all"):
+            key = detect_model_type(src)
+            print(f"[{key}] type auto-detected from {src}/config.json")
+        elif args.model in MODELS:
+            key = args.model
+            detected = detect_model_type(src)
+            if detected != key:                    # loaders are per-architecture — a mismatch here
+                ap.error(f"--model {src} looks like '{detected}' but you asked for '{key}'; "
+                         f"pass the matching keyword (or omit it to auto-detect)")
+        else:
+            ap.error(f"unknown model '{args.model}'; choose from {list(MODELS) + ['all']}")
+        print(f"[{key}] building from {src} (no download)")
+        build_model(key, src, device, args.precision, args.components, args.output_dir,
+                    exclude_llm=args.exclude_llm)
+        return
+
     if args.model == "all":
         if args.components:
             ap.error("--components cannot be combined with 'all'")
@@ -381,8 +458,18 @@ def main():
         keys = list(MODELS)
     elif args.model in MODELS:
         keys = [args.model]
+    elif Path(args.model).expanduser().is_dir():
+        # A filesystem path passed as the positional (documented in the module docstring, but the
+        # dispatch below used to only accept registry keys — so paths silently errored out).
+        # Equivalent to --model PATH; type is auto-detected and nothing is downloaded.
+        key, src = resolve_target(args.model)
+        print(f"[{key}] using checkpoint at {src} (auto-detected from config.json)")
+        build_model(key, src, device, args.precision, args.components, args.output_dir,
+                    exclude_llm=args.exclude_llm)
+        return
     else:
-        ap.error(f"unknown model '{args.model}'; choose from {list(MODELS) + ['all']}")
+        ap.error(f"unknown model '{args.model}'; choose from {list(MODELS) + ['all']} "
+                 f"or pass a path to a checkpoint dir containing config.json")
 
     for m in keys:
         src = ensure_checkpoint(m, args.repo)      # download if the local dir is missing

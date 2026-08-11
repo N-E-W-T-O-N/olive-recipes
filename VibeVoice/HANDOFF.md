@@ -203,6 +203,40 @@ Rules that fall out of this:
     never tested.** Audit every target dir for every expected file after a partial build — file
     presence, not just build exit status.
 
+22. **`build_olive` reported SUCCESS on a failed export.** Olive's `run()` logged a complete
+    `torch.export` traceback, then returned normally. `for src in tmp.glob("model.onnx*")` matched
+    nothing, so the move loop was a no-op, `print(f"  {component} done.")` fired, and `optimize.py`
+    exited 0 — leaving the previous graph in place. A rebuild that silently didn't happen looks
+    exactly like one that did. **Fixed:** `build_olive` now `sys.exit`s if the glob is empty.
+    Found while exporting realtime's KV-cached `text_lm` (`DynamicCache.from_legacy_cache` no longer
+    exists in transformers 5.x — see #23).
+
+23. **transformers 5.x removed the legacy KV-cache helpers.** `DynamicCache.from_legacy_cache()` and
+    `.to_legacy_cache()` are GONE, and there is no `.key_cache`. On 5.14: construct with
+    `DynamicCache(((k0,v0), (k1,v1), ...))` and read back via `cache.layers[i].keys/.values`.
+    Any wrapper that threads a KV cache through an export needs this. **Verify the wrapper in
+    PyTorch before exporting** — full-sequence vs prefill+step should match (realtime text_lm:
+    max|diff| 4.4e-05).
+
+24. **The acoustic decoder is CAUSAL, and its receptive field is enormous (~56 frames / 7.5 s).**
+    Measured on realtime's decoder with REAL latents:
+    - Prefix decoding is **bit-exact**: decoding the first n frames equals the first n frames of the
+      full decode (max|diff| 0.0). So streaming is achievable exactly, by replaying left context.
+    - Dropping left context is what breaks it. Sweeping context width against the full decode:
+      W=16 → −31 dB, W=32 → −44 dB, W=48 → −52 dB, **W=56 → −115 dB**, W=64+ → bit-identical.
+      This is why naive per-frame decoding left an audible seam every 3200 samples.
+    - ⚠️ **Measure with real latents, never random ones.** Fed random latents this decoder emits
+      near-silence (trap #7), so a receptive-field sweep on noise measures nothing — the first
+      attempt produced a flat ~2.4e-05 "error" at every width, which was just the silence floor.
+      `inference_realtime.py --save-latents` exists for this.
+    - **Perf wall:** replaying 56 frames per step costs ~1.5 s/step against a 133 ms realtime budget
+      (RTF ≈ 11.5). Cost is dominated by per-call overhead, not context length (1 frame = 237 ms,
+      but 30 frames = 30 ms/frame amortised; batch RTF 0.22). **So `--decode-mode stream` is
+      correct/bit-exact but NOT realtime-capable.** Genuine realtime streaming needs the decoder
+      exported WITH its conv-state cache (34 `SConv1d`/`SConvTranspose1d` layers carrying
+      `context_size` left context = 68 extra graph tensors, ~711 KB state), the direct analogue of
+      the `text_lm` KV export. Not yet done.
+
 ## 4. Architecture of our code (7 files, one direction of dependency)
 
 ```

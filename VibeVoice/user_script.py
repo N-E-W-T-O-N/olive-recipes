@@ -599,18 +599,95 @@ def _load_realtime_text_lm(model_path=None):
 
 
 def get_realtime_text_lm_model(model_path=None):
-    return _realtime_text_lm_wrapper(_load_realtime_text_lm(model_path)).eval().float()
+    return _realtime_text_lm_kv_wrapper(_load_realtime_text_lm(model_path)).eval().float()
+
+
+# The realtime text LM: 4 layers, 2 KV heads, head_dim 64 (verified against both the checkpoint and
+# the shipped voice-prompt caches, whose `lm` entry is 4 x [1, 2, P, 64]).
+_TEXT_LM_LAYERS, _TEXT_LM_KV_HEADS, _TEXT_LM_HEAD_DIM = 4, 2, 64
+
+
+def _realtime_text_lm_kv_wrapper(lm):
+    """KV-CACHED text LM: (input_ids, attention_mask, position_ids, past...) -> (hidden, present...).
+
+    Why this replaced the stateless export
+    --------------------------------------
+    Upstream keeps this LM KV-cached across text windows:
+
+        input_ids = torch.cat([input_ids, cur_input_tts_text_ids], dim=-1)
+        outputs   = self.forward_lm(**prepare_inputs_for_generation(input_ids, **model_kwargs))
+
+    so window k attends to ALL earlier text *and* to the voice prompt's 108-position `lm` prefix,
+    at its true rotary positions. A stateless graph can approximate the first two by re-encoding the
+    whole prefix every window, but it can NEVER accept the voice prompt's `lm` cache — that prefix
+    exists only as KV, there are no token ids to replay (upstream's prompt ids are all pad_id).
+
+    Layer count is fixed at 4 so the signature stays explicit: torch.export handles named tensor
+    args far more reliably than *args, and dynamic_shapes must key off real parameter names.
+    """
+    import torch
+    from transformers.cache_utils import DynamicCache
+
+    class _RealtimeTextLMKVWrapper(torch.nn.Module):
+        def __init__(self, lm):
+            super().__init__()
+            self.lm = lm
+
+        def forward(self, input_ids, attention_mask, position_ids,
+                    pk0, pv0, pk1, pv1, pk2, pv2, pk3, pv3):
+            # transformers 5.x: the legacy-tuple helpers (from_legacy_cache / to_legacy_cache) are
+            # GONE. The constructor takes the per-layer (key, value) pairs directly, and the filled
+            # cache is read back off `.layers[i].keys/.values` (there is no more `.key_cache`).
+            cache = DynamicCache(((pk0, pv0), (pk1, pv1), (pk2, pv2), (pk3, pv3)))
+            out = self.lm(input_ids=input_ids,
+                          attention_mask=attention_mask,
+                          position_ids=position_ids,
+                          past_key_values=cache,
+                          use_cache=True)
+            flat = []
+            for layer in out.past_key_values.layers:
+                flat += [layer.keys, layer.values]
+            return (out.last_hidden_state, *flat)
+
+    return _RealtimeTextLMKVWrapper(lm)
+
+
+def _text_lm_kv_names(prefix, suffixes=("key", "value")):
+    return [f"{prefix}.{i}.{s}" for i in range(_TEXT_LM_LAYERS) for s in suffixes]
 
 
 def get_realtime_text_lm_io_config(model=None):
-    return {"input_names": ["input_ids"], "output_names": ["lm_hidden"],
-            "input_shapes": [[1, 16]], "input_types": ["int64"],
-            "dynamic_shapes": {"input_ids": {0: "batch", 1: "seq"}}}
+    # ONNX names use the dotted genai convention (past_key_values.N.key / present.N.key) so the same
+    # OnnxLLM cache driver works for this graph and for llm_decoder.onnx. dynamic_shapes, by
+    # contrast, must key off the python parameter names torch.export sees.
+    pk_params = [f"p{s}{i}" for i in range(_TEXT_LM_LAYERS) for s in ("k", "v")]
+    dyn = {"input_ids": {0: "batch", 1: "seq"},
+           "attention_mask": {0: "batch", 1: "total"},
+           "position_ids": {0: "batch", 1: "seq"}}
+    for n in pk_params:
+        dyn[n] = {0: "batch", 2: "past"}
+    return {
+        "input_names": ["input_ids", "attention_mask", "position_ids"]
+                       + _text_lm_kv_names("past_key_values"),
+        "output_names": ["lm_hidden"] + _text_lm_kv_names("present"),
+        "dynamic_shapes": dyn,
+    }
 
 
 def get_realtime_text_lm_dummy_inputs(model=None):
     import torch
-    return {"input_ids": torch.randint(0, 1000, (1, 16), dtype=torch.int64)}
+    # Non-zero past in the dummy so the 'past' dim is genuinely exercised at export time; a 0-length
+    # dummy invites torch.export to specialise the dimension away, which would pin the graph to
+    # prefill-only. Runtime still feeds past=0 for the first call.
+    seq, past = 5, 3
+    d = {"input_ids": torch.randint(0, 1000, (1, seq), dtype=torch.int64),
+         "attention_mask": torch.ones((1, past + seq), dtype=torch.int64),
+         "position_ids": torch.arange(past, past + seq, dtype=torch.int64)[None, :]}
+    for i in range(_TEXT_LM_LAYERS):
+        for s in ("k", "v"):
+            d[f"p{s}{i}"] = torch.zeros(
+                (1, _TEXT_LM_KV_HEADS, past, _TEXT_LM_HEAD_DIM), dtype=torch.float32)
+    return d
 
 
 def export_realtime_extras(model_path, out_dir):

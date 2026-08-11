@@ -251,14 +251,21 @@ class OnnxLLM:
         self.kv_heads = shp[1].dim_value
         self.head_dim = shp[3].dim_value
         outs = [o.name for o in self.sess.get_outputs()]
-        # TTS backbone emits 'hidden_states'; an ASR decoder that kept lm_head emits 'logits'.
-        self.out_name = "logits" if "logits" in outs else "hidden_states"
+        # TTS backbone emits 'hidden_states'; an ASR decoder that kept lm_head emits 'logits';
+        # realtime's 4-layer text LM emits 'lm_hidden'.
+        self.out_name = next((n for n in ("logits", "hidden_states", "lm_hidden") if n in outs),
+                             outs[0])
+        # genai decoders take inputs_embeds (embeddings are excluded from the graph); realtime's
+        # text_lm keeps its own embed_tokens and takes input_ids. Same KV plumbing either way.
+        self.token_input = "input_ids" if "input_ids" in self.in_names else "inputs_embeds"
         # Fused GQA builds compute positions internally; the unfused fallback (fp16-on-CPU / fp32-on-CUDA)
         # declares a 'position_ids' input we must feed. Match the graph's float dtype (fp16 build wants
         # float16 embeds + KV cache), else ORT rejects the feed.
         self.wants_pos = "position_ids" in self.in_names
-        emb_t = next(i.type for i in self.sess.get_inputs() if i.name == "inputs_embeds")
-        self.float_dt = np.float16 if "float16" in emb_t else np.float32
+        # Take the float dtype from the KV cache, which every variant has — inputs_embeds does not
+        # exist on the input_ids-style graphs.
+        kv_t = next(i.type for i in self.sess.get_inputs() if i.name == "past_key_values.0.key")
+        self.float_dt = np.float16 if "float16" in kv_t else np.float32
         self.hidden = None
         self._reset()
 
@@ -272,11 +279,15 @@ class OnnxLLM:
         self.batch = batch
 
     def _run(self, embeds):
-        embeds = np.asarray(embeds, dtype=self.float_dt)
-        b, s, _ = embeds.shape
+        if self.token_input == "input_ids":
+            x = np.asarray(embeds, dtype=np.int64)
+            b, s = x.shape[0], x.shape[1]
+        else:
+            x = np.asarray(embeds, dtype=self.float_dt)
+            b, s, _ = x.shape
         prev = self.total
         self.total += s
-        feed = {"inputs_embeds": embeds,
+        feed = {self.token_input: x,
                 "attention_mask": np.ones((b, self.total), dtype=np.int64)}
         if self.wants_pos:  # positions of the newly-appended tokens
             feed["position_ids"] = np.arange(prev, prev + s, dtype=np.int64)[None, :].repeat(b, 0)

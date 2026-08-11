@@ -327,7 +327,15 @@ def build_olive(model: str, component: str, model_src: Path, target: Path, preci
         run(cfgp)
     finally:
         Path(cfgp).unlink(missing_ok=True)
-    for src in tmp.glob("model.onnx*"):
+    # Olive's run() can log a full export traceback and still return normally, leaving no model.onnx
+    # behind. Without this check the loop below silently moves nothing, we print "done", exit 0, and
+    # the stale previous graph stays in place — a failed build that looks like a successful one.
+    produced = list(tmp.glob("model.onnx*"))
+    if not produced:
+        sys.exit(f"[{model}] {component}: Olive produced no model.onnx in {tmp} — the export FAILED "
+                 f"(scroll up for the exporter traceback). {target/f'{component}.onnx'} was left "
+                 f"unchanged; do not treat this target as rebuilt.")
+    for src in produced:
         dst = target / src.name.replace("model.onnx", f"{component}.onnx")
         if dst.exists(): dst.unlink()
         shutil.move(str(src), str(dst))

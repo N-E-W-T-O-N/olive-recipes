@@ -159,6 +159,16 @@ def main():
     ap.add_argument("--eos-threshold", type=float, default=0.5,
                     help="Stop when sigmoid(tts_eos_classifier) exceeds this (upstream uses 0.5). "
                          "Lower = stops earlier/more eagerly.")
+    ap.add_argument("--decode-context", type=int, default=56, metavar="FRAMES",
+                    help="Left-context frames replayed per step in --decode-mode stream. The "
+                         "acoustic decoder's measured receptive field is ~56 frames (7.5 s); at 56 "
+                         "the streamed output is bit-identical to a full batch decode. Lower it to "
+                         "trade exactness for latency/compute: 48 = -52 dB, 32 = -44 dB, 16 = -31 dB.")
+    ap.add_argument("--save-latents", metavar="PATH",
+                    help="Dump the generated [1,F,64] acoustic latents to .npy. Needed for any "
+                         "decoder analysis: fed RANDOM latents the decoder emits near-silence "
+                         "(HANDOFF trap #7), so receptive-field/seam measurements are only "
+                         "meaningful on real ones.")
     ap.add_argument("--no-eos", action="store_true",
                     help="Ignore the learned stop and always run to --max-frames (debug).")
     ap.add_argument("--voice", default="Carter",
@@ -206,7 +216,10 @@ def main():
     print(f"    scale={scale:.4f} bias={bias:.4f}")
 
     tok = C.load_tokenizer(onnx_dir, src)
-    text_lm = C.OnnxOp(onnx_dir / "text_lm.onnx", device)
+    # KV-cached: text windows accumulate context exactly as upstream's forward_lm does, and the
+    # voice prompt's `lm` prefix can be seeded in (it exists ONLY as KV — upstream's prompt token
+    # ids are all pad_id, so there is nothing to replay through a stateless graph).
+    text_lm = C.OnnxLLM(onnx_dir / "text_lm.onnx", device)
     llm = C.OnnxLLM(onnx_dir / "llm_decoder.onnx", device)
     head = C.OnnxOp(onnx_dir / "diffusion_head.onnx", device)
     dec = C.OnnxOp(onnx_dir / "acoustic_decoder.onnx", device)
@@ -219,13 +232,8 @@ def main():
     ids_list = tok.encode(args.text.strip() + "\n", add_special_tokens=False)
     ids = np.asarray(ids_list, dtype=np.int64)[None]                        # [1,T]
 
-    def text_hidden(tok_ids):
-        """[1,w] ids -> [1,w,H] hidden from the 4-layer text LM."""
-        return np.asarray(text_lm.run(input_ids=np.asarray(tok_ids, dtype=np.int64)),
-                          dtype=np.float32)
-
-    probe = text_hidden(ids[:, :1])
-    H = probe.shape[-1]
+    H = int(text_lm.step(ids[:, :1]).shape[-1])   # probe; seed_prompt/_reset below clears the cache
+    text_lm._reset()
     type_embed = load_type_embed(onnx_dir, H)
     print(f"    text {ids.shape[1]} tokens (strip+\\n, no special tokens), hidden H={H}")
 
@@ -233,6 +241,15 @@ def main():
     if voice is None:
         print("  [voice][warn] NO voice prompt — the model is unconditioned and pitch will drift "
               "across the clip. Pass --voice Carter (see prepare_voices.py).")
+    else:
+        # Seed the TEXT LM with the prompt's `lm` prefix before any text is fed. This is the last
+        # structural gap vs the reference; with it, forward_lm's context is reproduced exactly.
+        p = text_lm.seed_prompt(*_voice_kv(voice, "lm"))
+        print(f"    seeded text LM with {p}-position voice prefix")
+
+    def text_hidden(tok_ids):
+        """[1,w] ids -> [1,w,H]. STATEFUL: appends to the text LM's KV cache, like forward_lm."""
+        return np.asarray(text_lm.step(np.asarray(tok_ids, dtype=np.int64)), dtype=np.float32)
 
     # --- CFG negative: a PARALLEL TTS-LM stream, not a constant --------------------------------
     # Upstream prefills neg_lm/neg_tts_lm with ONE token: tokenizer("<|image_pad|>"), then feeds it
@@ -275,6 +292,10 @@ def main():
 
     eos_prob = None if args.no_eos else load_eos_head(onnx_dir, H)
 
+    # samples emitted per acoustic frame — `speech_tok_compress_ratio` in preprocessor_config.json.
+    # Verified against the graph: a T-frame decode returns exactly T*3200 samples.
+    SPF = 3200
+
     chunks, latents, f, ti, hidden, first = [], [], 0, 0, None, True
     if voice is not None:
         # Seed the POSITIVE stream with the voice prompt's KV prefix. first=False so the text is
@@ -289,6 +310,10 @@ def main():
         if ti < ids.shape[1]:                                   # feed the next text window
             win = ids[:, ti:ti + TW]
             ti += win.shape[1]
+            # Feed ONLY the new window: text_lm.onnx is KV-cached now, so it already holds the voice
+            # prompt prefix plus every earlier window at their true rotary positions — exactly what
+            # upstream's forward_lm does. (Before the KV export this had to re-encode the whole
+            # prefix each window to fake the same context.)
             embeds = text_hidden(win) + type_embed[1]           # type 1 = TEXT
             hidden = llm.prefill(embeds) if first else llm.step(embeds)
             first = False
@@ -302,11 +327,24 @@ def main():
             cond = hidden[0, -1, :]
             ncond = neg_hidden[0, -1, :] if llm_neg is not None else neg_const
             latent = sampler.sample(cond, ncond, cfg_scale=args.cfg_scale, n_frames=1, seed=f)
+            latents.append(latent[0])
             if args.decode_mode == "stream":
-                # emit immediately (true streaming) — accepts a conv discontinuity per frame
-                chunks.append(np.asarray(C.acoustic_decode_to_wav(dec, latent[None], scale, bias)).ravel())
-            else:
-                latents.append(latent[0])                       # decode all together at the end
+                # TRUE streaming, and BIT-EXACT — not an approximation.
+                #
+                # The decoder is a causal conv stack, verified: decoding a PREFIX of n frames is
+                # bit-identical to the first n frames of the full decode (max|diff| = 0.0). What it
+                # cannot survive is losing its left context — upstream carries that in
+                # VibeVoiceTokenizerStreamingCache; our exported graph is stateless, so we replay it.
+                #
+                # Measured receptive field: ~56 frames (7.5 s!). Sweeping left context against the
+                # full decode: W=16 -> -31 dB, W=32 -> -44 dB, W=48 -> -52 dB, W=56 -> -115 dB,
+                # W=64+ -> bit-identical. That length is exactly why naive per-frame decoding left an
+                # audible seam every 3200 samples.
+                #
+                # Cost is BOUNDED (context+1 frames per step), not O(T^2) like a growing prefix.
+                hist = np.stack(latents[-(args.decode_context + 1):], 0)[None]
+                wav = np.asarray(C.acoustic_decode_to_wav(dec, hist, scale, bias)).ravel()
+                chunks.append(wav[-SPF:])                       # emit only the newest frame
             acoustic_embed = np.asarray(conn.run(features=latent[None]), dtype=np.float32)
             step_in = acoustic_embed + type_embed[0]            # type 0 = SPEECH
             hidden = llm.step(step_in)
@@ -334,6 +372,10 @@ def main():
     if not done and eos_prob is not None and ti >= ids.shape[1]:
         print("    [warn] ran out of text WITHOUT the learned stop firing — the tail is drift; "
               "try --eos-threshold below 0.5")
+
+    if args.save_latents and latents:
+        np.save(args.save_latents, np.stack(latents, 0)[None].astype(np.float32))
+        print(f"    saved latents {np.stack(latents,0)[None].shape} -> {args.save_latents}")
 
     if args.decode_mode == "batch" and latents:
         # ONE decode over the whole latent sequence: the acoustic decoder is a CAUSAL CONV stack, so

@@ -120,13 +120,16 @@ def convert(pt_path: Path, out_path: Path):
         return t.float().numpy().astype(np.float32)   # bfloat16 has no numpy dtype
 
     out = {}
-    for stream in ("tts_lm", "neg_tts_lm"):
+    # All four streams: the 20-layer TTS backbone (tts_lm) AND the 4-layer text encoder (lm), plus
+    # both CFG negatives. text_lm.onnx is now exported WITH past_key_values, so the `lm` prefix is
+    # injectable too — that prefix exists only as KV, since upstream's prompt token ids are all
+    # pad_id and cannot be replayed.
+    for stream in ("tts_lm", "neg_tts_lm", "lm", "neg_lm"):
         keys, vals = _kv_lists(obj[stream]["past_key_values"])
         for i, (k, v) in enumerate(zip(keys, vals)):
             out[f"{stream}.k.{i}"] = f32(k)
             out[f"{stream}.v.{i}"] = f32(v)
         out[f"{stream}.last_hidden_state"] = f32(obj[stream]["last_hidden_state"])
-    out["lm.last_hidden_state"] = f32(obj["lm"]["last_hidden_state"])
 
     np.savez(out_path, **out)
     n_layers = sum(1 for k in out if k.startswith("tts_lm.k."))

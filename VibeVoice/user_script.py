@@ -690,6 +690,135 @@ def get_realtime_text_lm_dummy_inputs(model=None):
     return d
 
 
+class _TracedConvCache:
+    """Minimal stand-in for VibeVoiceTokenizerStreamingCache, safe to trace.
+
+    The real one keys on (layer_id, sample_idx) and calls `sample_indices.tolist()` on every
+    get/set — data-dependent Python on a tensor, which torch.export will not tolerate. Batch is
+    fixed at 1 here (upstream asserts batch_size == 1 anyway), so a plain dict keyed by layer_id
+    round-trips the same [B, C, T] tensors the conv layers expect.
+    """
+
+    def __init__(self, initial=None):
+        self.d = dict(initial or {})
+
+    def get(self, layer_id, sample_indices=None):
+        return self.d.get(layer_id)
+
+    def set(self, layer_id, sample_indices, states):
+        self.d[layer_id] = states
+
+
+def _realtime_streaming_layers(codec):
+    """The conv layers that carry streaming state, in a STABLE order.
+
+    `layer_id` is `f"sconv1d_{id(self)}"` — object identity, so it is only meaningful inside one
+    process. named_modules() order is deterministic for a given module tree, which is what makes
+    the flat state layout below reproducible between export and inference.
+    """
+    return [m for _, m in codec.named_modules() if getattr(m, "context_size", None) is not None]
+
+
+def _realtime_state_spec(codec):
+    """[(layer_id, channels, context_size, offset, numel)] + total, for the flat state tensor."""
+    spec, off = [], 0
+    for m in _realtime_streaming_layers(codec):
+        ch = getattr(m, "in_channels", None) or getattr(m, "channels", None)
+        n = ch * m.context_size
+        spec.append((m.layer_id, ch, m.context_size, off, n))
+        off += n
+    return spec, off
+
+
+def _realtime_acoustic_decoder_stream_wrapper(codec):
+    """(latents [1,T,64], state [1,S]) -> (audio [1,1,T*3200], new_state [1,S]).
+
+    The whole point: make the decoder's conv state an ordinary graph tensor so streaming costs ONE
+    frame of work per frame, instead of replaying the decoder's ~56-frame receptive field every
+    step (which is bit-exact but runs at RTF 11.5 — see HANDOFF trap #24).
+
+    All 34 layer states are packed into ONE flat tensor rather than 68 separate graph I/Os. Every
+    shape is static, so the slice offsets are constants and the packing costs nothing.
+
+    Fixed-shape states are valid because each layer's cache is ALWAYS exactly `context_size`:
+    `input_with_context = cat([state, x])` is therefore never shorter than `context_size`, so the
+    "keep everything" fallback branch is unreachable. Verified against the one-shot decode:
+    max|diff| 1.4e-06, well under int16 quantisation (3.05e-05).
+    """
+    import torch
+
+    spec, total = _realtime_state_spec(codec)
+
+    class _StreamDecoder(torch.nn.Module):
+        def __init__(self, codec):
+            super().__init__()
+            self.codec = codec
+
+        def forward(self, latents, state):
+            cache = _TracedConvCache()
+            for lid, ch, ctx, off, n in spec:
+                cache.set(lid, None, state[:, off:off + n].reshape(1, ch, ctx))
+            # decode() asserts sample_indices is not None; _TracedConvCache ignores the value, so a
+            # constant satisfies the assert without introducing data-dependent Python.
+            idx = torch.zeros(1, dtype=torch.long)
+            out = self.codec.decode(latents, cache=cache, sample_indices=idx, use_cache=True)
+            audio = out.sample if hasattr(out, "sample") else (
+                out.audio if hasattr(out, "audio") else (out[0] if isinstance(out, tuple) else out))
+            new = [cache.get(lid).reshape(1, -1) for lid, _, _, _, _ in spec]
+            return audio, torch.cat(new, dim=1)
+
+    m = _StreamDecoder(codec)
+    m.state_size = total
+    m.state_spec = spec
+    return m
+
+
+def get_realtime_acoustic_decoder_stream_model(model_path=None):
+    codec = _load_realtime_acoustic_decoder(model_path)
+    return _realtime_acoustic_decoder_stream_wrapper(codec).eval().float()
+
+
+def _realtime_stream_state_size(model=None, model_path=None):
+    """Flat state length. Prefer the already-loaded wrapper — reloading the codec here would
+    double a multi-GB load just to read a shape."""
+    for obj in (model, getattr(model, "model", None)):
+        n = getattr(obj, "state_size", None)
+        if n:
+            return int(n)
+    src = Path(model_path) if model_path else (Path(__file__).parent / "realtime")
+    return _realtime_state_spec(_load_realtime_acoustic_decoder(src))[1]
+
+
+def get_realtime_acoustic_decoder_stream_io_config(model=None):
+    return {
+        "input_names": ["latents", "state_in"],
+        "output_names": ["audio", "state_out"],
+        # Only the latent-frame count is dynamic; the state layout is fixed by the architecture.
+        "dynamic_shapes": {"latents": {0: "batch", 1: "frames"}, "state": {0: "batch"}},
+    }
+
+
+def get_realtime_acoustic_decoder_stream_dummy_inputs(model=None):
+    import torch
+    size = _realtime_stream_state_size(model)
+    # 2 frames, not 1: exercises the dynamic 'frames' dim so torch.export cannot specialise it away.
+    return {"latents": torch.randn(1, 2, 64, dtype=torch.float32),
+            "state": torch.zeros(1, size, dtype=torch.float32)}
+
+
+def export_realtime_stream_state_meta(model_path, out_dir):
+    """Write the flat-state layout next to the ONNX so the driver can size/zero it."""
+    import json
+    spec, total = _realtime_state_spec(_load_realtime_acoustic_decoder(model_path))
+    meta = {"state_size": total, "layers": len(spec),
+            "layout": [{"channels": c, "context": ctx, "offset": o, "numel": n}
+                       for _, c, ctx, o, n in spec]}
+    p = Path(out_dir) / "acoustic_decoder_stream_state.json"
+    p.write_text(json.dumps(meta, indent=2))
+    print(f"  [stream] state {total} floats across {len(spec)} layers -> {p.name}")
+    return str(p)
+
+
 def export_realtime_extras(model_path, out_dir):
     """Dump the two tiny non-ONNX tensors sets the realtime driver needs, as .npy/.npz.
 

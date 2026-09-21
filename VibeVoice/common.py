@@ -51,6 +51,7 @@ MODEL_IDS = {
     "1.5b": "microsoft/VibeVoice-1.5B",
     "asr": "microsoft/VibeVoice-ASR",
     "asr-hf": "microsoft/VibeVoice-ASR-HF",
+    "asr-streaming": "microsoft/VibeVoice-ASR-Streaming-7B",
     "realtime": "microsoft/VibeVoice-Realtime-0.5B",
 }
 
@@ -348,6 +349,7 @@ EMBED_KEY = {
     "1.5b": "model.language_model.embed_tokens.weight",
     "asr": "model.language_model.embed_tokens.weight",
     "asr-hf": "language_model.model.embed_tokens.weight",
+    "asr-streaming": "model.language_model.embed_tokens.weight",
     "realtime": "model.tts_language_model.embed_tokens.weight",
 }
 

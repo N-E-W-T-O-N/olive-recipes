@@ -23,7 +23,15 @@ trust it. That decomposition + parity discipline is the whole method.
 | `1.5b` | codes/ (`vibevoice`) | Qwen2.5-1.5B, 28L | **No** (head = diffusion) | `encoder.downsample_layers.*` | `codes/` |
 | `asr` | codes/ (`vibevoice`, arch `VibeVoiceForASRTraining`) | Qwen2.5-**7B** | **Yes** (top-level `lm_head.weight`) | same as 1.5b | `codes/` |
 | `asr-hf` | transformers-native (`vibevoice_asr`) | Qwen2.5-**7B** | **Yes** (`language_model.lm_head.*`) | `acoustic_tokenizer_encoder.conv_layers.*` | transformers |
+| `asr-streaming` | codes/ layout (arch `VibeVoiceForASRStreamingTraining`) | Qwen2.5-**7B**, 28L (config accurate) | **Yes** (top-level `lm_head.weight`) | `encoder.downsample_layers.*` — **identical weight layout to `asr`**, verified 0/0 strict-load with `asr`'s loaders unmodified | `codes/` (reuses `asr`'s loaders) |
 | `realtime` | codes/ (`vibevoice_streaming`) | Qwen2.5-0.5B, **20L (config says 24!)** | No | `decoder.stages.*` — **decoder-only, no encoder shipped** | `codes/` |
+
+`asr-streaming` note: despite shipping NEW-looking tokens (`<|AUDIO|>`/`<|audio_bos|>`/`<|audio_eos|>`)
+in `added_tokens.json`, the real inference protocol (upstream `modeling_vibevoice_asr.py::
+streaming_generate`, GitHub commit `1541f59`) does NOT use them — it reuses the same Qwen-VL
+grounding tokens as `asr`/`asr-hf` (`<|object_ref_start|>`/`<|object_ref_end|>`) for speech markers.
+The only genuinely new, actually-used token is `<|text_chunk_end|>` (id 151665), which marks a
+streaming chunk boundary and is NOT in stock Qwen2.5's vocab — see trap #25.
 
 Rules that fall out of this:
 - **Never assume tokenizer classes are interchangeable across checkpoints.** Same class name,
@@ -172,8 +180,26 @@ Rules that fall out of this:
       19-token prefill reused for the 1-token decode. **So `cpu_fp16` is functionally BROKEN for
       generation, not merely slower.** (I first wrote this up as "correct, purely perf/memory";
       real inference disproved that. `cpu_int4` and `cpu_fp32`, both GQA, generate fine.)
-    - `cuda_fp32` (packed Attention) is the other non-GQA target and is **unverified** — exercise
-      generation on a GPU before trusting it.
+    - `cuda_fp32` (packed Attention) is **not merely unverified — its `llm_decoder.onnx` is a
+      STRUCTURALLY INVALID graph and cannot be loaded by ANY execution provider.** Proven on a
+      CPU-only box (2026-08-12), no GPU required:
+      `FAIL : This is an invalid model. Graph output (present.0.key) does not exist in the graph.`
+      That error comes from `Graph::InitializeStateFromModelFileGraphProto`, i.e. graph resolution
+      **before** EP partitioning, so it is EP-independent — a CUDA runtime would not save it.
+      Cause: the packed `Attention` op takes empty past inputs `['','','','']` and emits a SINGLE
+      output (the attention result). It produces no KV tensors. But genai's ModelBuilder still
+      declares the standard cache outputs, so the graph advertises 41 outputs of which **40
+      (`present.{0..19}.{key,value}`) are never produced by any node**. GQA emits
+      `['...output_0', 'present.0.key', 'present.0.value']` and has 0 missing.
+      **Treat `cuda_fp32` as unusable for VibeVoice; use `cuda_int4` or `cuda_fp16` (both GQA).**
+      Verify with: count declared graph outputs not present in `{o for n in graph.node for o in
+      n.output}` — a one-line check that needs no GPU and no session.
+    - **`eval.py` passed this target 5/5.** Its llm check is `onnx.load` + op counts and never
+      constructs an `InferenceSession`, so a graph that cannot be loaded at all still scores full
+      marks. Session construction is the cheapest real check available — do it.
+    - This is the **third distinct failure mode** of the same `(cuda, fp32) → packed Attention`
+      selection: Surya-2/qwen3_5 dies at BUILD time (`KeyError('root_input')`), VibeVoice builds
+      but emits an unloadable graph, and only GQA targets actually run.
     - **This is the same table behind the Surya-2 `cuda_fp32` crash.** There it's fatal because the
       qwen3_5 hybrid's `_make_full_attention` override never passes `root_input` to the packed op;
       here it's harmless because VibeVoice extracts a **stock `Qwen2ForCausalLM`**, whose base-class
@@ -237,6 +263,38 @@ Rules that fall out of this:
       `context_size` left context = 68 extra graph tensors, ~711 KB state), the direct analogue of
       the `text_lm` KV export. Not yet done.
 
+25. **`asr-streaming` (VibeVoice-ASR-Streaming-7B, 2026-09) — new tokens in the vocab are a red
+    herring; the real markers are the OLD reused ones, and the tokenizer ModelBuilder ships is
+    the WRONG one for this checkpoint specifically.**
+    - `added_tokens.json` adds `<|AUDIO|>`/`<|audio_bos|>`/`<|audio_eos|>` alongside
+      `<|text_chunk_end|>`, which looks like this checkpoint finally ships real dedicated speech
+      markers (fixing trap #16/#18). It does NOT: upstream's `VibeVoiceASRTextTokenizerFast.
+      _add_vibevoice_special_tokens` (source, not the shipped tokenizer_config.json) still sets
+      `speech_start_id`/`speech_end_id` to `<|object_ref_start|>`/`<|object_ref_end|>` — the same
+      Qwen-VL grounding tokens `asr`/`asr-hf` reuse. The `<|AUDIO|>`-family tokens exist in the
+      vocab but are unused by the actual `streaming_generate` code. Verified by reading upstream
+      source directly (`vibevoice/modular/modular_vibevoice_text_tokenizer.py` @ GitHub commit
+      `1541f59`) — do not infer marker tokens from `added_tokens.json` alone for a new checkpoint;
+      grep the actual tokenizer class.
+    - `<|text_chunk_end|>` (id 151665) IS genuinely new and IS used — it's one past the last id in
+      stock Qwen2.5's vocab (151664). But `extract_qwen2_asr`'s LLM extraction fetches a **stock**
+      `Qwen/Qwen2.5-7B` tokenizer (trap #10: VibeVoice ships no tokenizer — true for every OTHER
+      checkpoint), and ModelBuilder copies THAT into the built ONNX dir. `<|text_chunk_end|>`
+      resolves to `None`/unk in it. This checkpoint is the exception: it DOES ship its own
+      tokenizer files in the checkpoint dir, and the driver must load from there instead of the
+      ONNX dir — verified directly: `AutoTokenizer.from_pretrained(onnx_dir)` → `None` for
+      `<|text_chunk_end|>`, `AutoTokenizer.from_pretrained(checkpoint_dir)` → `151665`.
+      `inference_asr_streaming.py`'s `load_tokenizer_strict()` loads from the checkpoint dir and
+      asserts all three marker ids resolve, specifically to catch this.
+    - **Same GQA 7B backbone as every other ASR checkpoint → same trap #20 applies.** A
+      `--device cpu --precision fp16` build showed 0 GroupQueryAttention / 28 MultiHeadAttention in
+      `llm_decoder.onnx` — the known-broken `cpu_fp16` target (MHA forces `repeat_kv` on a
+      GQA-shaped model, which cannot decode past prefill). Build asr-streaming with `cpu_int4`,
+      `cpu_fp32`, `cuda_int4`, or `cuda_fp16` instead; avoid `cpu_fp16` and `cuda_fp32` (packed
+      Attention, structurally invalid graph). Not yet re-verified end-to-end on a working target —
+      do that before trusting a build (this is exactly the "eval.py cannot catch this, run the
+      driver" lesson from trap #20).
+
 ## 4. Architecture of our code (7 files, one direction of dependency)
 
 ```
@@ -263,6 +321,14 @@ read-only by path — never pip-install it, never edit it).
 
 **Done & parity-verified (cos ~1.0):** 19 sub-models — 1.5b (7/7 incl. int4 LLM), realtime (4/4),
 asr front-end (5), asr-hf front-end (3). End-to-end TTS runs for 1.5b + realtime.
+
+**`asr-streaming` (new 2026-09 checkpoint):** registered in `optimize.py`/`common.py`, reusing
+`asr`'s loaders unmodified (front-end strict-load 0/0 verified). `inference_asr_streaming.py`
+written (chunked/windowed protocol, own KV-cache session, correct markers — see trap #25). A
+`cpu/fp16` build completed (llm + all 5 front-end components, eval.py 7/7 component/pipeline
+PASS) but its `llm_decoder.onnx` hit the known trap #20 op-selection issue (MHA not GQA) — treat
+that specific build as unverified for actual generation until rebuilt on `cpu_int4`, `cpu_fp32`,
+`cuda_int4`, or `cuda_fp16` and smoke-tested with the driver.
 
 **Pending:** (a) 7B ASR LLM builds — RAM-bound, run on a big-memory machine; front-end +
 `inference_asr.py` are ready and degrade cleanly without it. (b) fp16 builds for TTS quality.

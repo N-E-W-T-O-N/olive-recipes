@@ -12,6 +12,10 @@ Models & components (all parity-verified vs PyTorch, cos ~1.0):
   asr      (VibeVoice-ASR, 7B)        llm acoustic_encoder acoustic_decoder
                                        semantic_encoder acoustic_connector semantic_connector
   asr-hf   (VibeVoice-ASR-HF, 7B)     llm acoustic_encoder semantic_encoder multi_modal_projector
+  asr-streaming (ASR-Streaming, 7B)   llm acoustic_encoder acoustic_decoder
+                                       semantic_encoder acoustic_connector semantic_connector
+                                       (same layout as `asr`; see HANDOFF.md trap #25 — build
+                                        cpu_int4/cpu_fp32/cuda_int4/cuda_fp16, NOT cpu_fp16/cuda_fp32)
   realtime (Realtime-0.5B, streaming) llm acoustic_decoder diffusion_head acoustic_connector
   acoustic (VibeVoice-AcousticTokenizer)  acoustic_encoder acoustic_decoder  (standalone; no LLM)
 
@@ -93,6 +97,27 @@ MODELS = {
             "semantic_connector": ("get_semantic_connector_model", "get_semantic_connector_io_config", "get_semantic_connector_dummy_inputs", {}),
         },
     },
+    # VibeVoice-ASR-Streaming-7B (`VibeVoiceForASRStreamingTraining`) — SAME weight layout as `asr`
+    # (vendored vibevoice/ codes-style tokenizers: downsample_layers naming; top-level lm_head.weight;
+    # LLM prefix model.language_model.*; connectors fc1/fc2/norm) — verified 0 missing/0 unexpected on
+    # all four front-end loaders with NO code changes. Differs from `asr` only in what the checkpoint
+    # ADDS beyond the exported sub-parts: dedicated audio tokens (<|AUDIO|>/<|audio_bos|>/<|audio_eos|>/
+    # <|text_chunk_end|>, ids 151665-151668) instead of reused Qwen-VL grounding tokens, and a chunked
+    # streaming protocol (preprocessor_config.json: chunk_frames=22, lookahead_frames=4) — both are
+    # inference-driver concerns, not export concerns, so the same extract_qwen2_asr/olive loaders apply.
+    # diffusion_head_config in config.json is VESTIGIAL (0 tensors contain "diffusion" in the index) —
+    # this is a pure ASR checkpoint, no audio generation, so there is no diffusion_head component here.
+    "asr-streaming": {
+        "dir": "asr-streaming",
+        "llm": ("extract_qwen2_asr", True, False),
+        "olive": {
+            "acoustic_encoder": ("get_acoustic_encoder_model", "get_acoustic_encoder_io_config", "get_acoustic_encoder_dummy_inputs", {}),
+            "acoustic_decoder": ("get_acoustic_decoder_model", "get_acoustic_decoder_io_config", "get_acoustic_decoder_dummy_inputs", {}),
+            "semantic_encoder": ("get_semantic_tokenizer_encoder_model", "get_semantic_tokenizer_encoder_io_config", "get_semantic_tokenizer_encoder_dummy_inputs", {}),
+            "acoustic_connector": ("get_acoustic_connector_model", "get_acoustic_connector_io_config", "get_acoustic_connector_dummy_inputs", {}),
+            "semantic_connector": ("get_semantic_connector_model", "get_semantic_connector_io_config", "get_semantic_connector_dummy_inputs", {}),
+        },
+    },
     "asr-hf": {
         "dir": "asr-hf",
         "llm": ("extract_qwen2_asrhf", True, False),
@@ -112,6 +137,10 @@ MODELS = {
         "olive": {
             "text_lm": ("get_realtime_text_lm_model", "get_realtime_text_lm_io_config", "get_realtime_text_lm_dummy_inputs", {}),
             "acoustic_decoder": ("get_realtime_acoustic_decoder_model", "get_realtime_acoustic_decoder_io_config", "get_realtime_acoustic_decoder_dummy_inputs", {}),
+            # Same weights as acoustic_decoder, but with the conv state exposed as a flat tensor so
+            # streaming costs one frame of work per frame instead of replaying a ~56-frame receptive
+            # field (trap #24). Build both: batch decode is still the faster path for offline use.
+            "acoustic_decoder_stream": ("get_realtime_acoustic_decoder_stream_model", "get_realtime_acoustic_decoder_stream_io_config", "get_realtime_acoustic_decoder_stream_dummy_inputs", {}),
             "diffusion_head": ("get_diffusion_head_model", "get_diffusion_head_io_config", "get_diffusion_head_dummy_inputs", {"VV_HEAD_HIDDEN": "896"}),
             "acoustic_connector": ("get_acoustic_connector_model", "get_acoustic_connector_io_config", "get_acoustic_connector_dummy_inputs", {}),
         },
@@ -133,6 +162,7 @@ HF_REPO = {
     "1.5b": "microsoft/VibeVoice-1.5B",
     "asr": "microsoft/VibeVoice-ASR",
     "asr-hf": "microsoft/VibeVoice-ASR-HF",
+    "asr-streaming": "microsoft/VibeVoice-ASR-Streaming-7B",
     "realtime": "microsoft/VibeVoice-Realtime-0.5B",
     "acoustic": "microsoft/VibeVoice-AcousticTokenizer",
 }
@@ -190,6 +220,8 @@ def detect_model_type(model_src: Path) -> str:
         return "realtime"
     if mt == "vibevoice_asr":
         return "asr-hf"
+    if arch == "VibeVoiceForASRStreamingTraining":
+        return "asr-streaming"
     if arch == "VibeVoiceForASRTraining":
         return "asr"
     if mt == "vibevoice_acoustic_tokenizer":
@@ -219,6 +251,7 @@ EMBED_WEIGHT_KEY = {
     "1.5b": "model.language_model.embed_tokens.weight",
     "asr": "model.language_model.embed_tokens.weight",
     "asr-hf": "language_model.model.embed_tokens.weight",
+    "asr-streaming": "model.language_model.embed_tokens.weight",
     "realtime": "model.tts_language_model.embed_tokens.weight",
 }
 

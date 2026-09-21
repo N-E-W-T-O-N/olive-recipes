@@ -1,8 +1,53 @@
 # VibeVoice-1.5B — Current Status
 
-> **Handoff:** read [HANDOFF.md](HANDOFF.md) — mental model, per-checkpoint table, the 10 traps, the new-checkpoint checklist, and the 5-minute operator card. Skill: `.claude/skills/vibevoice-onnx/`.
+> **Handoff:** read [HANDOFF.md](HANDOFF.md) — mental model, per-checkpoint table, the 25 traps, the new-checkpoint checklist, and the 5-minute operator card. Skill: `.claude/skills/vibevoice-onnx/`.
 
-_Updated: 2026-07-27_
+_Updated: 2026-09-21_
+
+## 2026-09-21 — VibeVoice-ASR-Streaming-7B added (recon + registry + driver; LLM build needs a retarget)
+
+New checkpoint `microsoft/VibeVoice-ASR-Streaming-7B` (`VibeVoiceForASRStreamingTraining`), local
+at `VibeVoice/asr-streaming/`. Recon (HANDOFF §A): 28-layer Qwen2 GQA backbone (28 heads/4 kv,
+hidden 3584) matching config exactly (no layer-count lie), top-level untied `lm_head.weight`,
+acoustic tokenizer with BOTH encoder+decoder (decoder dead for ASR), semantic tokenizer
+encoder-only, `diffusion_head_config` in `config.json` is vestigial (0 tensors named "diffusion"
+in the index — pure ASR checkpoint, no audio generation). Weight layout turned out **identical to
+`asr`** — verified by strict-loading (`strict=False`, assert 0/0) the acoustic tokenizer, semantic
+tokenizer, and both connectors against this checkpoint using `asr`'s EXISTING loader functions,
+unmodified: 0 missing / 0 unexpected on all four.
+
+- **Registry**: added `"asr-streaming"` to `optimize.py`'s `MODELS` (reuses `extract_qwen2_asr` +
+  `asr`'s Olive component specs), `HF_REPO`, `detect_model_type`, `EMBED_WEIGHT_KEY`; mirrored
+  `MODEL_IDS`/`EMBED_KEY` in `common.py`. `optimize.py --list` and path auto-detection both confirm.
+- **Protocol**: pulled the real inference code from GitHub (`vibevoice/modular/
+  modeling_vibevoice_asr.py::streaming_generate`, commit `1541f59` — postdates our vendored
+  303b283 pin, so this class isn't in the vendored tree) rather than guessing from
+  `added_tokens.json`. Two findings that would have produced a silently-wrong driver otherwise —
+  now documented as HANDOFF trap #25:
+  1. The checkpoint's new-looking tokens (`<|AUDIO|>`/`<|audio_bos|>`/`<|audio_eos|>`) are **not
+     used** — real speech markers are still the reused `<|object_ref_start|>`/`<|object_ref_end|>`
+     grounding tokens (same as `asr`/`asr-hf`).
+  2. `<|text_chunk_end|>` (id 151665) IS genuinely new and IS used, but the stock Qwen2.5-7B
+     tokenizer `extract_qwen2_asr` fetches (and that ModelBuilder copies into the ONNX dir) does
+     NOT have it — verified directly (`None` from the ONNX-dir tokenizer vs `151665` from the
+     checkpoint dir's own tokenizer). `inference_asr_streaming.py` loads from the checkpoint dir
+     specifically to avoid this.
+- **New driver**: `inference_asr_streaming.py` — one persistent KV-cache session for the whole
+  file; audio windowed by `chunk_frames`/`lookahead_frames` from `preprocessor_config.json`
+  (22+4 frames = 2.933s chunk / 0.533s lookahead, re-encoded fresh each window, no chat template);
+  per chunk feeds `[speech_start, fused_features, speech_end]`, greedy/temperature-decodes until
+  `<|text_chunk_end|>`/EOS, then unconditionally steps the `<|text_chunk_end|>` embed once more
+  (matches upstream) before the next chunk.
+- **Build**: `--device cpu --precision fp16 --model asr-streaming asr-streaming` completed (all 6
+  components + embeddings.onnx); `eval.py asr-streaming` → **7/7 PASS** (component parity cos
+  ~1.0, codec round-trip corr +0.996/SNR +19dB). BUT: `llm_decoder.onnx` showed **0
+  GroupQueryAttention / 28 MultiHeadAttention** — the known trap #20 broken op-selection for
+  `(cpu, fp16)` on a GQA-shaped model (prefills fine, decode step can fail on a KV-buffer shape
+  mismatch). `eval.py`'s llm check is structural (op counts) and doesn't catch this — matches the
+  documented lesson exactly. **This specific cpu_fp16 build is NOT verified end-to-end** (a
+  single-token decode smoke test was started but not confirmed complete before the build dir was
+  removed). Next: rebuild with `cpu_int4`, `cpu_fp32`, `cuda_int4`, or `cuda_fp16` and run
+  `inference_asr_streaming.py` for a real smoke test before shipping this checkpoint.
 
 ## 2026-07-27 (later) — VibeVoice-ASR eval 7/7 + WORKING inference (all 5 variants assembled)
 
@@ -157,6 +202,7 @@ Legend: ✅ converted & parity-verified · ⚠️ pending / partial / memory-bou
 | **VibeVoice-1.5B** (TTS) | ✅ int4 | ✅ cos 1.0 | ✅ cos 1.0 | ✅ cos 1.0 (enc) | ✅ cos 1.0 | ✅ cos 1.0 (ac+sem) |
 | **VibeVoice-ASR-HF** (7B) | ⚠️ extracted, int4 OOM | ✅ cos 1.0 | — | ✅ cos 1.0 | — | ✅ cos 1.0 (mm_projector) |
 | **VibeVoice-ASR** (7B) | ⚠️ 7B int4 OOM | ✅ cos 1.0 | ✅ cos 1.0² | ✅ cos 1.0 | — none | ✅ cos 1.0 (ac+sem) |
+| **VibeVoice-ASR-Streaming** (7B) | ⚠️ fp16 built but trap #20 (MHA not GQA) — needs int4/fp32/cuda | ✅ cos 1.0 | ✅ cos 1.0² | ✅ cos 1.0 | — none | ✅ cos 1.0 (ac+sem) |
 | **Realtime-0.5B** | ✅ int4 (tts) | — (none shipped) | ✅ cos 1.0 | — none | ✅ cos 1.0 | ✅ cos 1.0 (acoustic) |
 
 Encoder note: all acoustic/semantic **encoders** (1.5B, ASR, ASR-HF) currently bake the audio `samples` dim (24000 = 1 s @ 24 kHz) — the shared io_config uses `dynamic_axes`, which the dynamo exporter fixes. Frames/latents outputs are correct; a cross-cutting `dynamic_shapes` switch would make audio length variable (not yet applied).

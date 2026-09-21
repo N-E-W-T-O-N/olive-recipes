@@ -159,6 +159,12 @@ def main():
     ap.add_argument("--eos-threshold", type=float, default=0.5,
                     help="Stop when sigmoid(tts_eos_classifier) exceeds this (upstream uses 0.5). "
                          "Lower = stops earlier/more eagerly.")
+    ap.add_argument("--stream-chunk", type=int, default=6, metavar="FRAMES",
+                    help="Frames emitted per decode call in --decode-mode stream, when the stateful "
+                         "acoustic_decoder_stream.onnx is present. Trades latency for throughput: "
+                         "1 -> RTF 1.40 (0.13 s latency), 2 -> 0.99, 3 -> 0.64, 6 -> 0.39 (0.80 s). "
+                         "Default 6 matches TTS_SPEECH_WINDOW_SIZE, so a chunk is ready exactly "
+                         "when the generation loop finishes a speech window.")
     ap.add_argument("--decode-context", type=int, default=56, metavar="FRAMES",
                     help="Left-context frames replayed per step in --decode-mode stream. The "
                          "acoustic decoder's measured receptive field is ~56 frames (7.5 s); at 56 "
@@ -296,6 +302,47 @@ def main():
     # Verified against the graph: a T-frame decode returns exactly T*3200 samples.
     SPF = 3200
 
+    # --- streaming decode path ------------------------------------------------------------------
+    # Preferred: acoustic_decoder_stream.onnx, which carries the conv state (all 34 streaming conv
+    # layers packed into one flat [1,182080] tensor) as a graph input/output. One frame of work per
+    # frame -> RTF 0.39 at chunk 6, vs RTF 11.5 for replaying the ~56-frame receptive field.
+    # Fallback: context replay against the stateless decoder — bit-exact but far too slow to stream.
+    stream_dec = None
+    stream_state = None
+    if args.decode_mode == "stream":
+        sp = onnx_dir / "acoustic_decoder_stream.onnx"
+        if sp.exists():
+            stream_dec = C.OnnxOp(sp, device)
+            si = next(i for i in stream_dec.sess.get_inputs() if i.name == "state_in")
+            n_state = int(si.shape[1])
+            # fp16 targets export this graph in fp16; feeding fp32 raises
+            # "Unexpected input data type. Actual: (tensor(float)), expected: (tensor(float16))".
+            # Same recurring trap as HANDOFF #13 — match the graph's dtype, never assume fp32.
+            stream_dt = np.float16 if "float16" in si.type else np.float32
+            stream_state = np.zeros((1, n_state), dtype=stream_dt)
+            print(f"    streaming decoder: stateful ({n_state} floats of conv state, "
+                  f"chunk={args.stream_chunk} frames = {args.stream_chunk/7.5:.2f}s latency)")
+        else:
+            print(f"    [stream][warn] {sp.name} not built — falling back to {args.decode_context}-"
+                  f"frame context replay. Bit-exact but ~30x slower (RTF ~11.5, NOT realtime). "
+                  f"Build it with `optimize.py --components acoustic_decoder_stream realtime`.")
+
+    def emit(frames):
+        """Decode a list of latent frames to waveform, advancing the stream state if stateful."""
+        nonlocal stream_state
+        seq = np.stack(frames, 0)[None].astype(np.float32)
+        if stream_dec is not None:
+            lat_in = ((seq / (scale if scale else 1.0)) - bias).astype(stream_dt)
+            audio, stream_state = stream_dec.sess.run(
+                None, {"latents": lat_in, "state_in": stream_state})
+            return np.asarray(audio, dtype=np.float32).ravel()
+        # stateless fallback: replay left context, keep only the new tail
+        hist = np.stack(latents[-(args.decode_context + len(frames)):], 0)[None]
+        wav = np.asarray(C.acoustic_decode_to_wav(dec, hist, scale, bias)).ravel()
+        return wav[-len(frames) * SPF:]
+
+    pending = []
+
     chunks, latents, f, ti, hidden, first = [], [], 0, 0, None, True
     if voice is not None:
         # Seed the POSITIVE stream with the voice prompt's KV prefix. first=False so the text is
@@ -330,21 +377,10 @@ def main():
             latents.append(latent[0])
             if args.decode_mode == "stream":
                 # TRUE streaming, and BIT-EXACT — not an approximation.
-                #
-                # The decoder is a causal conv stack, verified: decoding a PREFIX of n frames is
-                # bit-identical to the first n frames of the full decode (max|diff| = 0.0). What it
-                # cannot survive is losing its left context — upstream carries that in
-                # VibeVoiceTokenizerStreamingCache; our exported graph is stateless, so we replay it.
-                #
-                # Measured receptive field: ~56 frames (7.5 s!). Sweeping left context against the
-                # full decode: W=16 -> -31 dB, W=32 -> -44 dB, W=48 -> -52 dB, W=56 -> -115 dB,
-                # W=64+ -> bit-identical. That length is exactly why naive per-frame decoding left an
-                # audible seam every 3200 samples.
-                #
-                # Cost is BOUNDED (context+1 frames per step), not O(T^2) like a growing prefix.
-                hist = np.stack(latents[-(args.decode_context + 1):], 0)[None]
-                wav = np.asarray(C.acoustic_decode_to_wav(dec, hist, scale, bias)).ravel()
-                chunks.append(wav[-SPF:])                       # emit only the newest frame
+                pending.append(latent[0])
+                if len(pending) >= args.stream_chunk:
+                    chunks.append(emit(pending))
+                    pending = []
             acoustic_embed = np.asarray(conn.run(features=latent[None]), dtype=np.float32)
             step_in = acoustic_embed + type_embed[0]            # type 0 = SPEECH
             hidden = llm.step(step_in)
@@ -372,6 +408,10 @@ def main():
     if not done and eos_prob is not None and ti >= ids.shape[1]:
         print("    [warn] ran out of text WITHOUT the learned stop firing — the tail is drift; "
               "try --eos-threshold below 0.5")
+
+    if args.decode_mode == "stream" and pending:
+        chunks.append(emit(pending))                # flush the final partial chunk
+        pending = []
 
     if args.save_latents and latents:
         np.save(args.save_latents, np.stack(latents, 0)[None].astype(np.float32))

@@ -295,15 +295,46 @@ def extract_embed_matrix(model: str, model_src: Path, target: Path, precision: s
     print(f"  [embed] embeddings.onnx {tuple(W.shape)} {np_dt.__name__} -> {target}")
 
 
+def _fix_missing_eos_token_id(qwen2_dir: Path):
+    """Patch a null `eos_token_id` in an extracted standalone Qwen2 config.json.
+
+    None of the 4 extractors set it — VibeVoice's `decoder_config`/`text_config` never carries
+    one (VibeVoice manages EOS via its own vendored tokenizer/driver logic, not the HF config
+    field), so every extracted config has `eos_token_id: null`. That was harmless on
+    onnxruntime-genai <=0.14: `create_model` just used it as-is. On >=0.15,
+    `base.py::union_chat_eos_token_ids` (called from `make_genai_config`) does
+    `ids = [eos_token_id]` when it isn't already a list — i.e. `ids = [None]` — then unions in
+    the tokenizer's own eos id, producing `[151643, None]`. That mixed list then fails
+    huggingface_hub's strict config dataclass validation (`StrictDataclassFieldValidationError`:
+    eos_token_id expects int/list[int]/None, not a list containing None) and crashes the build
+    AFTER the multi-minute weight serialize has already completed. Set it from the tokenizer we
+    just fetched into this same dir so the union has nothing to append and short-circuits clean.
+    """
+    import json
+    cfg_path = qwen2_dir / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    if cfg.get("eos_token_id") is not None:
+        return
+    from transformers import AutoTokenizer
+    eos_id = AutoTokenizer.from_pretrained(str(qwen2_dir)).eos_token_id
+    if eos_id is None:
+        print(f"  [llm][warn] tokenizer in {qwen2_dir} has no eos_token_id either — leaving config.json as-is")
+        return
+    cfg["eos_token_id"] = eos_id
+    cfg_path.write_text(json.dumps(cfg, indent=2))
+    print(f"  [llm] config.json eos_token_id was null -> set to {eos_id} (from the extracted tokenizer)")
+
+
 def build_llm(model: str, model_src: Path, target: Path, precision: str, device: str):
     """Extract a standalone Qwen2 dir, then ModelBuilder → llm_decoder.onnx at --precision."""
     import user_script
-    from onnxruntime_genai.models.builder import create_model
+    from onnxruntime_genai.models.builder import create_model, parse_extra_options
 
     extract_name, excl_embeds, excl_head = MODELS[model]["llm"]
     extract = getattr(user_script, extract_name)
     _log(f"    [llm] extract={extract_name} -> standalone Qwen2 dir")
     qwen2 = extract(str(model_src), str(HERE))
+    _fix_missing_eos_token_id(Path(qwen2))
     target.mkdir(parents=True, exist_ok=True)
     genai_device = DEVICES[device][2]
     # Unique cache dir PER INVOCATION (not a shared `.mb_cache_{model}`). onnxruntime-genai's
@@ -317,8 +348,19 @@ def build_llm(model: str, model_src: Path, target: Path, precision: str, device:
     print(f"  ModelBuilder: llm_decoder {precision} on {genai_device} "
           f"(exclude_embeds={excl_embeds}, exclude_lm_head={excl_head}) -> {target}/llm_decoder.onnx")
     try:
-        create_model("", qwen2, str(target), precision, genai_device, cache_dir=str(cache),
-                     filename="llm_decoder.onnx", exclude_embeds=excl_embeds, exclude_lm_head=excl_head)
+        # onnxruntime-genai >=0.15 split create_model's old one-call API into two steps:
+        # parse_extra_options() resolves + validates the extra-options dict (and, critically,
+        # populates a `hf_details` entry create_model now requires — calling create_model
+        # directly raises `KeyError: 'hf_details'` / "Hugging Face details not found").
+        # Its bool-flag parser only accepts the CLI string forms ("true"/"false"/"1"/"0"), not
+        # native Python bools — a bare `exclude_embeds=True` kwarg fails the same way under 0.16.0.
+        extra = parse_extra_options(
+            "", qwen2, str(target), precision, genai_device, str(cache),
+            [f"exclude_embeds={'true' if excl_embeds else 'false'}",
+             f"exclude_lm_head={'true' if excl_head else 'false'}",
+             "filename=llm_decoder.onnx"],
+        )
+        create_model("", qwen2, str(target), precision, genai_device, cache_dir=str(cache), **extra)
     finally:
         shutil.rmtree(cache, ignore_errors=True)
     print("  llm_decoder done.")

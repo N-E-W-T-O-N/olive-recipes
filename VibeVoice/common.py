@@ -251,6 +251,24 @@ class OnnxLLM:
         shp = next(i for i in g.input if i.name == "past_key_values.0.key").type.tensor_type.shape.dim
         self.kv_heads = shp[1].dim_value
         self.head_dim = shp[3].dim_value
+        if not self.head_dim or not self.kv_heads:
+            # onnxruntime-genai >=0.16 declares the head-size dim of past_key_values SYMBOLICALLY
+            # ("kv_cache_dim", no literal) instead of a fixed int — dim_value then reads back as the
+            # protobuf-unset default 0. A zero-length initial KV cache built from head_dim=0 makes the
+            # very first prefill fail: "Input 'past_key' dimension 3 should match the packed KV head
+            # dimension, got 0 expected 128". genai_config.json (shipped next to every LLM build) has
+            # the real values unambiguously in model.decoder.{head_size,num_key_value_heads} — read
+            # from there instead of trusting the graph's shape metadata for this.
+            import json
+            cfg_path = Path(path).parent / "genai_config.json"
+            if cfg_path.exists():
+                dec = json.loads(cfg_path.read_text()).get("model", {}).get("decoder", {})
+                self.head_dim = self.head_dim or dec.get("head_size", 0)
+                self.kv_heads = self.kv_heads or dec.get("num_key_value_heads", 0)
+            if not self.head_dim or not self.kv_heads:
+                raise RuntimeError(
+                    f"could not determine head_dim/kv_heads for {path} — graph shape is symbolic "
+                    f"and {cfg_path} is missing or incomplete")
         outs = [o.name for o in self.sess.get_outputs()]
         # TTS backbone emits 'hidden_states'; an ASR decoder that kept lm_head emits 'logits';
         # realtime's 4-layer text LM emits 'lm_hidden'.

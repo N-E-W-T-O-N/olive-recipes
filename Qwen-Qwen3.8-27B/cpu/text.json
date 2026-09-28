@@ -1,0 +1,18 @@
+{
+    "input_model": {
+        "type": "HfModel",
+        "model_path": "Qwen/Qwen3.8-27B"
+    },
+    "passes": {
+        "m": {
+            "type": "ModelBuilder",
+            "precision": "fp16",
+            "extra_options": {
+                "filename": "text.onnx",
+                "prune_lm_head": true
+            }
+        }
+    },
+    "no_artifacts": true,
+    "output_dir": "cpu/models/text.onnx"
+}

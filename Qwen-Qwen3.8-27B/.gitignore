@@ -1,0 +1,12 @@
+# Generated model artifacts
+models/
+
+# HF Hub download cache/lock files (left by `hf download --local-dir`)
+.cache/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Olive cache
+.olive-cache/

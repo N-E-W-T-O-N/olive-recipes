@@ -1,0 +1,31 @@
+{
+    "input_model": {
+        "type": "HfModel",
+        "model_path": "Qwen/Qwen3.8-27B"
+    },
+    "passes": {
+        "m": {
+            "type": "ModelBuilder",
+            "precision": "fp32",
+            "extra_options": {
+                "filename": "text.onnx",
+                "prune_lm_head": true
+            }
+        }
+    },
+    "engine": {
+        "target": {
+            "type": "LocalSystem",
+            "accelerators": [
+                {
+                    "device": "cpu",
+                    "execution_providers": [
+                        "OpenVINOExecutionProvider"
+                    ]
+                }
+            ]
+        }
+    },
+    "no_artifacts": true,
+    "output_dir": "openvino/models/text.onnx"
+}

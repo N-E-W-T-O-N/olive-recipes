@@ -2,7 +2,76 @@
 
 > **Handoff:** read [HANDOFF.md](HANDOFF.md) — mental model, per-checkpoint table, the 25 traps, the new-checkpoint checklist, and the 5-minute operator card. Skill: `.claude/skills/vibevoice-onnx/`.
 
-_Updated: 2026-09-21_
+_Updated: 2026-09-23_
+
+## 2026-09-23 — VibeVoice-ASR-Streaming-7B cpu_int4 built + compared against cpu_fp32; --mic mode added
+
+Built `onnx/asr-streaming/cpu_int4/` (same registry/loaders, no code changes needed — the 4
+regression fixes from trap #26 apply equally to int4). `eval.py asr-streaming --precision int4` →
+**7/7 PASS**, `llm` shows `MatMulNBits=141 GQA=28` — the correct, safe op combo (same as fp32; both
+land in the GQA-safe cell of trap #20's table). Full driver comparison against `cpu_fp32`:
+
+| | cpu_fp32 | cpu_int4 |
+|---|---|---|
+| `llm_decoder.onnx.data` | 28.3 GB | 4.5 GB (~6x smaller) |
+| Transcript on `en-Alice_woman.wav` | verified (2026-09-22) | **byte-identical to fp32** |
+| Session load + full 4-chunk decode | several minutes | **59s total** |
+
+Confirms HANDOFF trap #5's prediction: int4's raw-hidden-state quantization loss matters for the
+TTS checkpoints (conditioning a diffusion head) but is essentially free for ASR, which only needs
+clean token generation through `lm_head`. **`cpu_int4` is now the recommended target for this
+checkpoint** — same quality, far faster, small enough to plausibly keep up with live audio.
+
+**`--mic` mode added to `inference_asr_streaming.py`.** Refactored the per-chunk decode logic
+(persistent KV-cache session + audio encode + token loop) out of the old single `main()` loop into
+a reusable `ChunkDecoder` class, so file mode (`run_file`) and the new live mode (`run_mic`) share
+identical decode behavior — regression-tested: file mode produces the exact same transcript
+post-refactor. `run_mic` captures via `sounddevice` into a small rolling buffer; each time it has
+`chunk_frames+lookahead_frames` worth of fresh audio it decodes that window and slides forward by
+`chunk_samples` (keeping the lookahead tail for reuse, mirroring the file-mode window overlap),
+looping until Ctrl+C. Added `sounddevice` to `pyproject.toml`. `--list-devices` prints available
+audio devices; a runtime warning fires if `--mic` is combined with a `cpu`+`fp32` target (decode
+too slow to keep up with live audio — use `cpu_int4`/`cuda_*` instead).
+
+## 2026-09-22 — VibeVoice-ASR-Streaming-7B DONE: cpu_fp32 built, eval 7/7, real transcript end-to-end
+
+Picked up from 2026-09-21 (recon/registry/driver done, LLM build blocked). Rebuilt on
+`--device cpu --precision fp32` (avoiding `cpu_fp16`'s trap #20 MHA-not-GQA break) →
+`onnx/asr-streaming/cpu_fp32/` (32 GB — expected 2x the checkpoint's 17 GB bf16 size, since fp32
+is 4 bytes/param vs the checkpoint's native 2). `eval.py asr-streaming` → **7/7 PASS**, `llm`
+component shows `MatMulNBits=0 GQA=28` — the correct attention op this time.
+
+Getting the build to actually complete, then actually decode, surfaced **4 separate regressions**
+from bumping `onnxruntime-genai` 0.14.1→0.16.0 and `transformers` 5.14.1→5.17.0 earlier in this
+session (see HANDOFF trap #26 for full detail — all fixed in shared code, so every other
+checkpoint's next rebuild benefits too):
+1. `create_model()` raised `KeyError: 'hf_details'` — genai's API now requires calling
+   `parse_extra_options()` first. Fixed in `optimize.py::build_llm`.
+2. AFTER the ~4-minute, 28-tensor weight serialize finished, `make_genai_config` crashed with
+   `StrictDataclassFieldValidationError` on `eos_token_id=[151643, None]` — our extracted configs
+   have always had `eos_token_id: null` (harmless pre-0.15), and genai's new
+   `union_chat_eos_token_ids` mishandles that. Fixed with `optimize.py::_fix_missing_eos_token_id`
+   (patches every extracted standalone Qwen2 config right after extraction) — also
+   hand-patched the already-extracted `qwen2_asr_standalone/` so the fix applied without redoing
+   the extraction.
+3. `inference_asr_streaming.py`'s `load_tokenizer_strict()` crashed calling
+   `AutoTokenizer.from_pretrained(checkpoint_dir)` — pulls in `AutoConfig` → `VibeVoiceConfig`'s
+   new strict `diffusion_head_config.hidden_size == text_config.hidden_size` validator, which this
+   checkpoint's codes-family config layout can never satisfy (text_config isn't even the right key
+   here — see trap #25). Fixed by loading `Qwen2TokenizerFast.from_pretrained(src)` directly,
+   bypassing `AutoConfig` entirely.
+4. First `llm.prefill()` call crashed: `GroupQueryAttention ... Input 'past_key' dimension 3 ...
+   got 0 expected 128`. `common.py::OnnxLLM` parsed `head_dim` off the ONNX graph's shape
+   metadata; genai >=0.16 now declares that dim symbolically (`kv_cache_dim`, no literal) instead
+   of a fixed int, so it silently read back as `0`. Fixed by falling back to `genai_config.json`
+   (`model.decoder.head_size`/`num_key_value_heads`, always explicit) whenever the graph-shape
+   parse is 0 — this is the shared KV-cache driver all 4 drivers use, fixed once for all of them.
+
+**Verified with the real driver**, not just `eval.py`: `inference_asr_streaming.py --audio
+samples/voices/en-Alice_woman.wav onnx/asr-streaming/cpu_fp32` → 4 chunks, no crashes, coherent
+speaker-attributed transcript:
+> Speaker 0: So just to clarify, we've had nineteen to twenty year olds on our podcast so far.
+> Speaker 0: And if you don't mind me asking, how old are you?
 
 ## 2026-09-21 — VibeVoice-ASR-Streaming-7B added (recon + registry + driver; LLM build needs a retarget)
 
@@ -202,7 +271,7 @@ Legend: ✅ converted & parity-verified · ⚠️ pending / partial / memory-bou
 | **VibeVoice-1.5B** (TTS) | ✅ int4 | ✅ cos 1.0 | ✅ cos 1.0 | ✅ cos 1.0 (enc) | ✅ cos 1.0 | ✅ cos 1.0 (ac+sem) |
 | **VibeVoice-ASR-HF** (7B) | ⚠️ extracted, int4 OOM | ✅ cos 1.0 | — | ✅ cos 1.0 | — | ✅ cos 1.0 (mm_projector) |
 | **VibeVoice-ASR** (7B) | ⚠️ 7B int4 OOM | ✅ cos 1.0 | ✅ cos 1.0² | ✅ cos 1.0 | — none | ✅ cos 1.0 (ac+sem) |
-| **VibeVoice-ASR-Streaming** (7B) | ⚠️ fp16 built but trap #20 (MHA not GQA) — needs int4/fp32/cuda | ✅ cos 1.0 | ✅ cos 1.0² | ✅ cos 1.0 | — none | ✅ cos 1.0 (ac+sem) |
+| **VibeVoice-ASR-Streaming** (7B) | ✅ fp32 + int4 (cpu), both GQA=28, driver-verified identical transcripts; int4 ~6x smaller, ~6x+ faster | ✅ cos 1.0 | ✅ cos 1.0² | ✅ cos 1.0 | — none | ✅ cos 1.0 (ac+sem) |
 | **Realtime-0.5B** | ✅ int4 (tts) | — (none shipped) | ✅ cos 1.0 | — none | ✅ cos 1.0 | ✅ cos 1.0 (acoustic) |
 
 Encoder note: all acoustic/semantic **encoders** (1.5B, ASR, ASR-HF) currently bake the audio `samples` dim (24000 = 1 s @ 24 kHz) — the shared io_config uses `dynamic_axes`, which the dynamo exporter fixes. Frames/latents outputs are correct; a cross-cutting `dynamic_shapes` switch would make audio length variable (not yet applied).

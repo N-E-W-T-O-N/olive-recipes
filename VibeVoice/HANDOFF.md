@@ -291,9 +291,80 @@ Rules that fall out of this:
       `llm_decoder.onnx` — the known-broken `cpu_fp16` target (MHA forces `repeat_kv` on a
       GQA-shaped model, which cannot decode past prefill). Build asr-streaming with `cpu_int4`,
       `cpu_fp32`, `cuda_int4`, or `cuda_fp16` instead; avoid `cpu_fp16` and `cuda_fp32` (packed
-      Attention, structurally invalid graph). Not yet re-verified end-to-end on a working target —
-      do that before trusting a build (this is exactly the "eval.py cannot catch this, run the
-      driver" lesson from trap #20).
+      Attention, structurally invalid graph).
+    - **RESOLVED 2026-09-22**: `cpu_fp32` built clean (`eval.py` 7/7, `MatMulNBits=0 GQA=28`,
+      correct op) and `inference_asr_streaming.py` produced a real, coherent, speaker-attributed
+      transcript end-to-end on `samples/voices/en-Alice_woman.wav` — 4 chunks, no crashes:
+      `"Speaker 0: So just to clarify, we've had nineteen to twenty year olds on our podcast so
+      far. Speaker 0: And if you don't mind me asking, how old are you?"`. Getting there required
+      fixing 4 separate regressions from bumping `onnxruntime-genai` 0.14.1→0.16.0 and
+      `transformers` 5.14.1→5.17.0 in the same session — see trap #26, all fixed in shared code
+      (`optimize.py`/`common.py`) so they're already fixed for every OTHER checkpoint's next build.
+    - **RESOLVED 2026-09-23, recommended target now `cpu_int4`**: built and compared against
+      `cpu_fp32` — same op safety (`MatMulNBits=141 GQA=28`), byte-identical transcript, but
+      6x smaller (4.5 GB vs 28.3 GB) and full session-load+decode in **59s** vs several minutes.
+      Confirms trap #5's prediction: int4's hidden-state quantization loss is a TTS-diffusion
+      problem, not an ASR-token-generation one. `--mic` (live microphone) mode added to
+      `inference_asr_streaming.py`, built for `cpu_int4`/`cuda_*` speeds — see its module
+      docstring; `cpu_fp32` prints a runtime warning if combined with `--mic` (too slow to track
+      live audio).
+
+26. **Bumping `onnxruntime-genai` 0.14.1→0.16.0 + `transformers` 5.14.1→5.17.0 broke 4 DIFFERENT
+    things across the pipeline (2026-09-22) — none caught by `eval.py`, all only surfaced by
+    actually running a build + the inference driver.** All 4 fixes are in shared code, so they
+    apply to every checkpoint (1.5b/asr/asr-hf/realtime/asr-streaming), not just the one that
+    happened to trigger each one first:
+    - **(a) `create_model()`'s API split in two.** onnxruntime-genai >=0.15 requires calling
+      `parse_extra_options(...)` BEFORE `create_model(...)` — the latter now does
+      `extra_options.pop("hf_details")` and raises `KeyError`/`"Hugging Face details not found in
+      extra_options. Please call parse_extra_options before create_model."` if you skip it. Its
+      bool-flag parser also only accepts the CLI string forms (`"true"`/`"false"`/`"1"`/`"0"`), not
+      native Python `True`/`False` — passing a bare bool kwarg fails the same way. Fixed in
+      `optimize.py::build_llm` — see the `parse_extra_options(...)` call right before
+      `create_model(...)`.
+    - **(b) `eos_token_id: null` → `[151643, None]` crash, AFTER the multi-minute weight
+      serialize.** None of the 4 `extract_qwen2_*` functions set `eos_token_id` (VibeVoice's
+      `decoder_config`/`text_config` never carries one). Harmless on genai <=0.14 — `create_model`
+      just used it as-is. On >=0.15, `base.py::union_chat_eos_token_ids` does `ids = [eos_token_id]`
+      for a non-list value — i.e. `ids = [None]` — then unions in the tokenizer's real eos id,
+      producing the mixed list `[151643, None]`, which fails `huggingface_hub`'s strict config
+      dataclass validation (`StrictDataclassFieldValidationError`: expects `int`/`list[int]`/`None`,
+      not a list containing `None`) inside `make_genai_config`, well after `Saving ONNX model...`
+      has already finished writing tens of GB. Fixed with `optimize.py::_fix_missing_eos_token_id`
+      — runs right after every `extract()` call, patches `config.json`'s `eos_token_id` from the
+      tokenizer we already fetched into the same standalone dir, before ModelBuilder ever touches it.
+    - **(c) `AutoTokenizer.from_pretrained(checkpoint_dir)` crashes on an UNRELATED model-config
+      validator.** transformers' `VibeVoiceConfig` gained a strict cross-field check:
+      `diffusion_head_config.hidden_size` must equal `text_config.hidden_size`. `asr`/`asr-streaming`
+      use the codes-family `decoder_config` key (not the transformers-native `text_config` key
+      `VibeVoiceConfig` expects), so `text_config` silently defaults to a generic Qwen2 config
+      (hidden_size 4096) that can never match the checkpoint's real — and for asr-streaming,
+      vestigial/unused (trap #25) — `diffusion_head_config` (hidden_size 3584).
+      `AutoTokenizer.from_pretrained` resolves `AutoConfig` internally even though only the
+      tokenizer is needed, so this crashes tokenizer LOADING with a model-config error that has
+      nothing to do with the tokenizer. Fixed in `inference_asr_streaming.py::load_tokenizer_strict`
+      by loading `Qwen2TokenizerFast.from_pretrained(src)` directly (the class
+      `tokenizer_config.json` itself declares) — bypasses `AutoConfig`/`AutoModel` resolution
+      entirely. **Any driver that calls `AutoTokenizer.from_pretrained` on a raw VibeVoice
+      checkpoint dir (not the ONNX dir) should use this pattern**, not just asr-streaming's.
+    - **(d) `OnnxLLM`'s `head_dim` parsing silently reads 0 → first prefill crashes with a
+      `GroupQueryAttention` shape error.** `common.py::OnnxLLM.__init__` read `head_dim` off
+      `past_key_values.0.key`'s ONNX graph shape (`dim[3].dim_value`). onnxruntime-genai >=0.16
+      now declares that dim SYMBOLICALLY (`dim_param="kv_cache_dim"`, no literal) instead of a
+      fixed int; `dim_value` reads back as protobuf's unset-int default, `0`. The resulting
+      zero-length-AND-zero-width initial KV cache tensor makes the very first `prefill()` fail:
+      `Non-zero status code returned while running GroupQueryAttention node ... Input 'past_key'
+      dimension 3 should match the packed KV head dimension, got 0 expected 128`. `kv_heads`
+      (dim 1) was still a literal in this build and parsed fine — only the head-size dim changed.
+      Fixed by falling back to `genai_config.json` (shipped next to every LLM build,
+      `model.decoder.{head_size,num_key_value_heads}` are always explicit there) whenever the
+      graph-shape parse comes back 0. This is the shared KV-cache driver ALL FOUR inference
+      scripts use — fixed once for all of them.
+    **Lesson: a version bump you did for one reason (fixing trap #20's op-selection) can silently
+    break three unrelated things you weren't touching. `eval.py`'s structural checks caught NONE
+    of (a)/(b)/(c)/(d) — every one of them only showed up by actually running `optimize.py` through
+    a full build and then running the inference driver, which is the whole point of trap #20's own
+    "eval.py cannot catch this" lesson generalizing further than just attention-op selection.**
 
 ## 4. Architecture of our code (7 files, one direction of dependency)
 
@@ -322,13 +393,16 @@ read-only by path — never pip-install it, never edit it).
 **Done & parity-verified (cos ~1.0):** 19 sub-models — 1.5b (7/7 incl. int4 LLM), realtime (4/4),
 asr front-end (5), asr-hf front-end (3). End-to-end TTS runs for 1.5b + realtime.
 
-**`asr-streaming` (new 2026-09 checkpoint):** registered in `optimize.py`/`common.py`, reusing
-`asr`'s loaders unmodified (front-end strict-load 0/0 verified). `inference_asr_streaming.py`
-written (chunked/windowed protocol, own KV-cache session, correct markers — see trap #25). A
-`cpu/fp16` build completed (llm + all 5 front-end components, eval.py 7/7 component/pipeline
-PASS) but its `llm_decoder.onnx` hit the known trap #20 op-selection issue (MHA not GQA) — treat
-that specific build as unverified for actual generation until rebuilt on `cpu_int4`, `cpu_fp32`,
-`cuda_int4`, or `cuda_fp16` and smoke-tested with the driver.
+**`asr-streaming` (new 2026-09 checkpoint) — DONE, end-to-end verified 2026-09-22.** Registered in
+`optimize.py`/`common.py`, reusing `asr`'s loaders unmodified (front-end strict-load 0/0
+verified). `inference_asr_streaming.py` written (chunked/windowed protocol, own KV-cache session,
+correct markers — see trap #25). `onnx/asr-streaming/cpu_fp32/`: `eval.py` 7/7 PASS
+(`MatMulNBits=0 GQA=28`, correct GQA op — the earlier `cpu_fp16` attempt hit trap #20's known MHA
+op-selection break and was abandoned in favor of `fp32`), and `inference_asr_streaming.py`
+produces a real, coherent, speaker-attributed transcript end-to-end (see trap #25's "RESOLVED"
+note for the transcript). Getting from "builds" to "actually decodes" required fixing 4 separate
+regressions from the `onnxruntime-genai`/`transformers` bumps — trap #26, all fixed in shared code
+so every other checkpoint benefits on its next rebuild too.
 
 **Pending:** (a) 7B ASR LLM builds — RAM-bound, run on a big-memory machine; front-end +
 `inference_asr.py` are ready and degrade cleanly without it. (b) fp16 builds for TTS quality.

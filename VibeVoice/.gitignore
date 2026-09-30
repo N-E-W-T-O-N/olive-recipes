@@ -6,4 +6,6 @@ cpu_int4/models/*.onnx.data
 _genai_*/
 __pycache__/
 *.pyc
+
+# ModelBuilder per-run cache dirs
 .mb_cache_*/
